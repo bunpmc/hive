@@ -84,11 +84,16 @@ class QueenPhaseState:
     inject_notification: Any = None  # async (str) -> None
     event_bus: Any = None  # EventBus — for emitting QUEEN_PHASE_CHANGED events
 
-    # Phase-specific prompts (set by session_manager after construction)
+    # Phase-specific base prompts (set by orchestrator after construction).
+    # Do NOT bake memory_block into these — it is appended dynamically.
     prompt_planning: str = ""
     prompt_building: str = ""
     prompt_staging: str = ""
     prompt_running: str = ""
+
+    # Cross-session memory block — refreshed after each consolidation so the
+    # queen sees up-to-date memory even when compaction happens mid-session.
+    memory_block: str = ""
 
     def get_current_tools(self) -> list:
         """Return tools for the current phase."""
@@ -101,14 +106,16 @@ class QueenPhaseState:
         return list(self.building_tools)
 
     def get_current_prompt(self) -> str:
-        """Return the system prompt for the current phase."""
+        """Return the system prompt for the current phase with current memory."""
         if self.phase == "planning":
-            return self.prompt_planning
-        if self.phase == "running":
-            return self.prompt_running
-        if self.phase == "staging":
-            return self.prompt_staging
-        return self.prompt_building
+            base = self.prompt_planning
+        elif self.phase == "running":
+            base = self.prompt_running
+        elif self.phase == "staging":
+            base = self.prompt_staging
+        else:
+            base = self.prompt_building
+        return base + self.memory_block
 
     async def _emit_phase_event(self) -> None:
         """Publish a QUEEN_PHASE_CHANGED event so the frontend updates the tag."""

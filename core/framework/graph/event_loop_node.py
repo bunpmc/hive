@@ -2824,6 +2824,17 @@ class EventLoopNode(NodeProtocol):
         if ctx.node_spec.skip_judge:
             return JudgeVerdict(action="RETRY")  # feedback=None → not logged
 
+        # --- Level 0b: output completion gate ------------------------------
+        # If all required outputs are already filled, fall straight through to
+        # the safety checks and ACCEPT — regardless of tool calls made this turn
+        # and regardless of whether a custom judge would otherwise give feedback.
+        _missing = self._get_missing_output_keys(
+            accumulator, ctx.node_spec.output_keys, ctx.node_spec.nullable_output_keys
+        )
+        if ctx.node_spec.output_keys and not _missing:
+            # Skip directly to safety checks — custom judge is not consulted.
+            return await self._accept_if_safe(ctx, accumulator, conversation, iteration)
+
         # --- Level 1: custom judge -----------------------------------------
 
         if self._judge is not None:
@@ -2847,25 +2858,37 @@ class EventLoopNode(NodeProtocol):
 
         # --- Level 2: implicit judge ---------------------------------------
 
+        # --- Level 2: implicit judge (outputs still incomplete) ------------
+        # Level 0b already handled the "outputs complete" case above.
+
         # Real tool calls were made — let the agent keep working.
         if tool_results:
             return JudgeVerdict(action="RETRY")  # feedback=None → not logged
 
-        missing = self._get_missing_output_keys(
-            accumulator, ctx.node_spec.output_keys, ctx.node_spec.nullable_output_keys
-        )
-
-        if missing:
+        if _missing:
             return JudgeVerdict(
                 action="RETRY",
                 feedback=(
-                    f"Task incomplete. Required outputs not yet produced: {missing}. "
+                    f"Task incomplete. Required outputs not yet produced: {_missing}. "
                     f"Follow your system prompt instructions to complete the work."
                 ),
             )
 
-        # All output keys present — run safety checks before accepting.
+        # No output_keys defined — fall through to safety checks.
+        return await self._accept_if_safe(ctx, accumulator, conversation, iteration)
 
+    async def _accept_if_safe(
+        self,
+        ctx: NodeContext,
+        accumulator: OutputAccumulator,
+        conversation: NodeConversation,
+        iteration: int,
+    ) -> JudgeVerdict:
+        """Run safety checks and return ACCEPT or a RETRY with feedback.
+
+        Called when all required output keys are present (or there are none).
+        Shared by the output-completion gate (Level 0b) and the implicit judge.
+        """
         output_keys = ctx.node_spec.output_keys or []
         nullable_keys = set(ctx.node_spec.nullable_output_keys or [])
 
@@ -2895,7 +2918,7 @@ class EventLoopNode(NodeProtocol):
                 ),
             )
 
-        # Level 2b: conversation-aware quality check (if success_criteria set)
+        # Conversation-aware quality check (if success_criteria set)
         if ctx.node_spec.success_criteria and ctx.llm:
             from framework.graph.conversation_judge import evaluate_phase_completion
 

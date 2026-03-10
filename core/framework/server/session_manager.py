@@ -328,7 +328,6 @@ class SessionManager:
         )
 
         # Notify queen about the loaded worker (skip for queen itself).
-        # Health judge disabled for simplicity.
         if agent_path.name != "queen" and session.worker_runtime:
             # await self._start_judge(session, session.runner._storage_path)
             await self._notify_queen_worker_loaded(session)
@@ -537,11 +536,19 @@ class SessionManager:
         _consolidation_session_dir = queen_dir
 
         async def _on_compaction(_event) -> None:
-            from framework.agents.queen.queen_memory import consolidate_queen_memory
+            from framework.agents.queen.queen_memory import (
+                consolidate_queen_memory,
+                format_for_injection,
+            )
 
             await consolidate_queen_memory(
                 session.id, _consolidation_session_dir, _consolidation_llm
             )
+            # Refresh the memory block on phase_state so the queen sees updated
+            # memory in subsequent turns without waiting for a new session.
+            if session.phase_state is not None:
+                _mem = format_for_injection()
+                session.phase_state.memory_block = f"\n\n{_mem}" if _mem else ""
 
         from framework.runtime.event_bus import EventType as _ET
 

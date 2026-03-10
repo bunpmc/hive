@@ -101,6 +101,11 @@ async def create_queen(
         phase_state=phase_state,
     )
 
+    # ---- Memory tools (always registered) ----------------------------
+    from framework.tools.queen_memory_tools import register_queen_memory_tools
+
+    register_queen_memory_tools(queen_registry)
+
     # ---- Monitoring tools (only when worker is loaded) ----------------
     if session.worker_runtime:
         from framework.tools.worker_monitoring_tools import register_worker_monitoring_tools
@@ -147,6 +152,13 @@ async def create_queen(
             "No worker agent loaded. You are operating independently.\n"
             "Handle all tasks directly using your coding tools."
         )
+
+    # Cross-session memory — stored on phase_state so it can be refreshed
+    # after each consolidation without rebuilding the whole prompt.
+    from framework.agents.queen.queen_memory import format_for_injection
+
+    _memory = format_for_injection()
+    phase_state.memory_block = f"\n\n{_memory}" if _memory else ""
 
     _planning_body = (
         _queen_style
@@ -206,7 +218,8 @@ async def create_queen(
                 )
             )
         body = _planning_body if phase_state.phase == "planning" else _building_body
-        return HookResult(system_prompt=persona + "\n\n" + body)
+        # Use phase_state.memory_block so persona hook also sees refreshed memory.
+        return HookResult(system_prompt=persona + "\n\n" + body + phase_state.memory_block)
 
     # ---- Graph preparation -------------------------------------------
     initial_prompt_text = phase_state.get_current_prompt()

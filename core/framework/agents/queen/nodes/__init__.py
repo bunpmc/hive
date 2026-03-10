@@ -81,6 +81,7 @@ _QUEEN_PLANNING_TOOLS = [
     "initialize_and_build_agent",
     # Load existing agent (after user confirms)
     "load_built_agent",
+    "write_to_diary",  # Episodic memory — available in all phases
 ]
 
 # Building phase: full coding + agent construction tools.
@@ -643,6 +644,12 @@ on what it does from Worker Profile>."
 Google Maps, extracts contact details, and syncs them to Google Sheets.
    ask_user("Do you want to run it?", ["Yes, run it", "Check credentials first",
             "Modify the worker"])
+
+## Tool calls
+
+Always write at least one sentence of explanation before invoking any tool. \
+Never emit a bare tool call with no preceding text — the explanation tells the \
+user (and yourself) what you are doing and why.
 
 ## When user ask identity and responsibility
 

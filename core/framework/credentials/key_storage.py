@@ -79,9 +79,19 @@ def save_credential_key(key: str) -> Path:
 def generate_and_save_credential_key() -> str:
     """Generate a new Fernet key and persist it to ``~/.hive/secrets/credential_key``.
 
+    If a key file already exists on disk, returns the existing key instead of
+    overwriting it.  Overwriting would orphan all ``.enc`` files encrypted
+    with the previous key.
+
     Returns:
-        The generated key string.
+        The key string (existing or newly generated).
     """
+    # Never overwrite an existing key — that orphans all .enc files
+    existing = _read_credential_key_file()
+    if existing:
+        os.environ[CREDENTIAL_KEY_ENV_VAR] = existing
+        return existing
+
     from cryptography.fernet import Fernet
 
     key = Fernet.generate_key().decode()

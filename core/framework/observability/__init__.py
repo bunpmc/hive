@@ -14,10 +14,13 @@ from framework.observability.logging import (
     get_trace_context,
     set_trace_context,
 )
+from framework.observability.profiling import get_profile_snapshot, start_debug_profiling
 
 __all__ = [
     "configure_logging",
     "get_trace_context",
     "set_trace_context",
     "clear_trace_context",
+    "start_debug_profiling",
+    "get_profile_snapshot",
 ]

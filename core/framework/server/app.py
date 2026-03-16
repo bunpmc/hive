@@ -249,6 +249,10 @@ def create_app(model: str | None = None) -> web.Application:
     register_graph_routes(app)
     register_log_routes(app)
 
+    from framework.server.routes_debug import register_routes as register_debug_routes
+
+    register_debug_routes(app)
+
     # Static file serving — Option C production mode
     # If frontend/dist/ exists, serve built frontend files on /
     _setup_static_serving(app)

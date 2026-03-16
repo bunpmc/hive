@@ -1644,6 +1644,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     async def run_server():
         manager = app["manager"]
 
+        # Start event loop profiling when --debug is active.
+        _profiler = None
+        if getattr(args, "debug", False):
+            from framework.observability.profiling import start_debug_profiling
+
+            _profiler = await start_debug_profiling()
+
         # Preload agents specified via --agent
         for agent_path in args.agent:
             try:
@@ -1673,6 +1680,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if has_frontend:
             print(f"Dashboard: {dashboard_url}")
         print(f"Health: {dashboard_url}/api/health")
+        if _profiler is not None:
+            print(f"Profiler: {dashboard_url}/api/debug/profile")
         print(f"Agents loaded: {sum(1 for s in manager.list_sessions() if s.worker_runtime)}")
         print()
         print("Press Ctrl+C to stop")
@@ -1687,6 +1696,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             pass
         finally:
+            if _profiler is not None:
+                await _profiler.stop()
+                _profiler.print_summary()
             await manager.shutdown_all()
             await runner.cleanup()
 

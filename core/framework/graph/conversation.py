@@ -33,20 +33,12 @@ class Message:
     is_transition_marker: bool = False
     # True when this message is real human input (from /chat), not a system prompt
     is_client_input: bool = False
-    # Optional image content blocks (e.g. from browser_screenshot)
-    image_content: list[dict[str, Any]] | None = None
     # True when message contains an activated skill body (AS-10: never prune)
     is_skill_content: bool = False
 
     def to_llm_dict(self) -> dict[str, Any]:
         """Convert to OpenAI-format message dict."""
         if self.role == "user":
-            if self.image_content:
-                blocks: list[dict[str, Any]] = []
-                if self.content:
-                    blocks.append({"type": "text", "text": self.content})
-                blocks.extend(self.image_content)
-                return {"role": "user", "content": blocks}
             return {"role": "user", "content": self.content}
 
         if self.role == "assistant":
@@ -57,15 +49,6 @@ class Message:
 
         # role == "tool"
         content = f"ERROR: {self.content}" if self.is_error else self.content
-        if self.image_content:
-            # Multimodal tool result: text + image content blocks
-            blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
-            blocks.extend(self.image_content)
-            return {
-                "role": "tool",
-                "tool_call_id": self.tool_use_id,
-                "content": blocks,
-            }
         return {
             "role": "tool",
             "tool_call_id": self.tool_use_id,
@@ -91,8 +74,6 @@ class Message:
             d["is_transition_marker"] = self.is_transition_marker
         if self.is_client_input:
             d["is_client_input"] = self.is_client_input
-        if self.image_content is not None:
-            d["image_content"] = self.image_content
         return d
 
     @classmethod
@@ -108,7 +89,6 @@ class Message:
             phase_id=data.get("phase_id"),
             is_transition_marker=data.get("is_transition_marker", False),
             is_client_input=data.get("is_client_input", False),
-            image_content=data.get("image_content"),
         )
 
 
@@ -351,13 +331,17 @@ class NodeConversation:
     def system_prompt(self) -> str:
         return self._system_prompt
 
-    def update_system_prompt(self, new_prompt: str) -> None:
+    def update_system_prompt(
+        self, new_prompt: str, output_keys: list[str] | None = None
+    ) -> None:
         """Update the system prompt.
 
         Used in continuous conversation mode at phase transitions to swap
         Layer 3 (focus) while preserving the conversation history.
         """
         self._system_prompt = new_prompt
+        if output_keys is not None:
+            self._output_keys = output_keys
         self._meta_persisted = False  # re-persist with new prompt
 
     def set_current_phase(self, phase_id: str) -> None:
@@ -395,7 +379,6 @@ class NodeConversation:
         *,
         is_transition_marker: bool = False,
         is_client_input: bool = False,
-        image_content: list[dict[str, Any]] | None = None,
     ) -> Message:
         msg = Message(
             seq=self._next_seq,
@@ -404,7 +387,6 @@ class NodeConversation:
             phase_id=self._current_phase,
             is_transition_marker=is_transition_marker,
             is_client_input=is_client_input,
-            image_content=image_content,
         )
         self._messages.append(msg)
         self._next_seq += 1
@@ -433,7 +415,6 @@ class NodeConversation:
         tool_use_id: str,
         content: str,
         is_error: bool = False,
-        image_content: list[dict[str, Any]] | None = None,
         is_skill_content: bool = False,
     ) -> Message:
         msg = Message(
@@ -443,7 +424,6 @@ class NodeConversation:
             tool_use_id=tool_use_id,
             is_error=is_error,
             phase_id=self._current_phase,
-            image_content=image_content,
             is_skill_content=is_skill_content,
         )
         self._messages.append(msg)
@@ -771,7 +751,7 @@ class NodeConversation:
             delete_before = recent_messages[0].seq if recent_messages else self._next_seq
             await self._store.delete_parts_before(delete_before)
             await self._store.write_part(summary_msg.seq, summary_msg.to_storage_dict())
-            await self._store.write_cursor({"next_seq": self._next_seq})
+            await self._write_cursor_update({"next_seq": self._next_seq})
 
         self._messages = [summary_msg] + recent_messages
         self._last_api_input_tokens = None  # reset; next LLM call will recalibrate
@@ -975,7 +955,7 @@ class NodeConversation:
             # Write kept structural messages (they may have been modified)
             for msg in kept_structural:
                 await self._store.write_part(msg.seq, msg.to_storage_dict())
-            await self._store.write_cursor({"next_seq": self._next_seq})
+            await self._write_cursor_update({"next_seq": self._next_seq})
 
         # Reassemble: reference + kept structural (in original order) + recent
         self._messages = [ref_msg] + kept_structural + recent_messages
@@ -1012,7 +992,7 @@ class NodeConversation:
         """Remove all messages, keep system prompt, preserve ``_next_seq``."""
         if self._store:
             await self._store.delete_parts_before(self._next_seq)
-            await self._store.write_cursor({"next_seq": self._next_seq})
+            await self._write_cursor_update({"next_seq": self._next_seq})
         self._messages.clear()
         self._last_api_input_tokens = None
 
@@ -1047,6 +1027,14 @@ class NodeConversation:
 
     # --- Persistence internals ---------------------------------------------
 
+    async def _write_cursor_update(self, data: dict[str, Any]) -> None:
+        """Merge cursor updates instead of clobbering existing crash-recovery state."""
+        if self._store is None:
+            return
+        cursor = await self._store.read_cursor() or {}
+        cursor.update(data)
+        await self._store.write_cursor(cursor)
+
     async def _persist(self, message: Message) -> None:
         """Write-through a single message.  No-op when store is None."""
         if self._store is None:
@@ -1054,7 +1042,7 @@ class NodeConversation:
         if not self._meta_persisted:
             await self._persist_meta()
         await self._store.write_part(message.seq, message.to_storage_dict())
-        await self._store.write_cursor({"next_seq": self._next_seq})
+        await self._write_cursor_update({"next_seq": self._next_seq})
 
     async def _persist_meta(self) -> None:
         """Lazily write conversation metadata to the store (called once)."""

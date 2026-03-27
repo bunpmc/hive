@@ -433,7 +433,6 @@ class ExecutionStream:
         content: str,
         *,
         is_client_input: bool = False,
-        image_content: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Inject user input into a running client-facing EventLoopNode.
 
@@ -445,9 +444,7 @@ class ExecutionStream:
         for executor in self._active_executors.values():
             node = executor.node_registry.get(node_id)
             if node is not None and hasattr(node, "inject_event"):
-                await node.inject_event(
-                    content, is_client_input=is_client_input, image_content=image_content
-                )
+                await node.inject_event(content, is_client_input=is_client_input)
                 return True
         return False
 
@@ -1019,6 +1016,22 @@ class ExecutionStream:
             else:
                 status = SessionStatus.ACTIVE
 
+            persisted_input_data = dict(ctx.input_data or {})
+            entry_node_id = getattr(self.entry_spec, "entry_node", None) or getattr(
+                self.graph, "entry_node", None
+            )
+            entry_input_keys: list[str] = []
+            if entry_node_id and hasattr(self.graph, "get_node"):
+                entry_node = self.graph.get_node(entry_node_id)
+                entry_input_keys = list(getattr(entry_node, "input_keys", []) or [])
+
+            if result and isinstance(result.output, dict):
+                for key in entry_input_keys:
+                    if persisted_input_data.get(key) in (None, ""):
+                        value = result.output.get(key)
+                        if value not in (None, ""):
+                            persisted_input_data[key] = value
+
             # Create SessionState
             if result:
                 # Create from execution result
@@ -1029,7 +1042,7 @@ class ExecutionStream:
                     stream_id=self.stream_id,
                     correlation_id=ctx.correlation_id,
                     started_at=ctx.started_at.isoformat(),
-                    input_data=ctx.input_data,
+                    input_data=persisted_input_data,
                     agent_id=self.graph.id,
                     entry_point=self.entry_spec.id,
                 )
@@ -1064,7 +1077,7 @@ class ExecutionStream:
                     ),
                     progress=progress,
                     memory=ss.get("memory", {}),
-                    input_data=ctx.input_data,
+                    input_data=persisted_input_data,
                 )
 
             # Handle error case

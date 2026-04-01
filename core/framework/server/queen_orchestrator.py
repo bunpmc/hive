@@ -103,6 +103,23 @@ async def create_queen(
         except Exception:
             logger.warning("Queen: MCP config failed to load", exc_info=True)
 
+    try:
+        registry = MCPRegistry()
+        registry.initialize()
+        if (queen_pkg_dir / "mcp_registry.json").is_file():
+            queen_registry.set_mcp_registry_agent_path(queen_pkg_dir)
+        registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
+        if registry_configs:
+            results = queen_registry.load_registry_servers(
+                registry_configs,
+                preserve_existing_tools=True,
+                log_collisions=True,
+                max_tools=selection_max_tools,
+            )
+            logger.info("Queen: loaded MCP registry servers: %s", results)
+    except Exception:
+        logger.warning("Queen: MCP registry config failed to load", exc_info=True)
+
     # ---- Phase state --------------------------------------------------
     initial_phase = "staging" if worker_identity else "planning"
     phase_state = QueenPhaseState(phase=initial_phase, event_bus=session.event_bus)

@@ -104,6 +104,8 @@ async def create_queen(
             logger.warning("Queen: MCP config failed to load", exc_info=True)
 
     try:
+        from framework.runner.mcp_registry import MCPRegistry
+
         registry = MCPRegistry()
         registry.initialize()
         if (queen_pkg_dir / "mcp_registry.json").is_file():

@@ -1631,14 +1631,6 @@ class AgentRunner:
                     api_key=api_key,
                     api_base=api_base,
                 )
-            elif api_key and use_kimi_code:
-                # Kimi Code subscription uses the Kimi coding API (OpenAI-compatible).
-                # The api_base is set automatically by LiteLLMProvider for kimi/ models.
-                self._llm = LiteLLMProvider(
-                    model=self.model,
-                    api_key=api_key,
-                    api_base=api_base,
-                )
             elif use_antigravity:
                 # Direct OAuth to Google's internal Cloud Code Assist gateway.
                 # No local proxy required — AntigravityProvider handles token

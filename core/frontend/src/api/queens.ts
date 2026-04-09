@@ -37,4 +37,17 @@ export const queensApi = {
       initial_prompt: initialPrompt,
       initial_phase: initialPhase || undefined,
     }),
+
+  /** Select a specific historical session for a queen. */
+  selectSession: (queenId: string, sessionId: string) =>
+    api.post<QueenSessionResult>(`/queen/${queenId}/session/select`, {
+      session_id: sessionId,
+    }),
+
+  /** Create a fresh session for a queen. */
+  createNewSession: (queenId: string, initialPrompt?: string, initialPhase?: string) =>
+    api.post<QueenSessionResult>(`/queen/${queenId}/session/new`, {
+      initial_prompt: initialPrompt,
+      initial_phase: initialPhase || undefined,
+    }),
 };

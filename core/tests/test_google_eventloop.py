@@ -22,6 +22,10 @@ logging.getLogger("framework.llm.google").setLevel(logging.DEBUG)
 from framework.config import RuntimeConfig  # noqa: E402
 from framework.graph.event_loop_node import EventLoopNode, LoopConfig  # noqa: E402
 from framework.graph.node import DataBuffer, NodeContext, NodeResult, NodeSpec  # noqa: E402
+from framework.agent_loop.agent_loop import AgentLoop as EventLoopNode  # noqa: E402
+from framework.agent_loop.internals.types import LoopConfig  # noqa: E402
+from framework.orchestrator.node import DataBuffer, NodeContext, NodeResult, NodeSpec  # noqa: E402
+from framework.llm.litellm import LiteLLMProvider  # noqa: E402
 
 
 def make_provider():

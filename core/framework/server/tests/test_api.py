@@ -117,8 +117,8 @@ class MockRuntime:
     def list_graphs(self):
         return ["primary"]
 
-    def get_graph_registration(self, graph_id):
-        if graph_id == "primary":
+    def get_graph_registration(self, colony_id):
+        if colony_id == "primary":
             return self._registration
         return None
 
@@ -192,10 +192,10 @@ def _make_session(
         llm=mock_llm,
         loaded_at=1000000.0,
         queen_executor=queen_executor,
-        graph_id=agent_id,
+        colony_id=agent_id,
         worker_path=agent_path,
         runner=runner,
-        graph_runtime=rt,
+        colony_runtime=rt,
         worker_info=MockAgentInfo(),
     )
 
@@ -394,7 +394,7 @@ class TestSessionCRUD:
     async def test_create_session_with_worker_forwards_session_id(self):
         app = create_app()
         manager = app["manager"]
-        manager.create_session_with_worker_graph = AsyncMock(
+        manager.create_session_with_worker_colony = AsyncMock(
             return_value=_make_session(agent_id="my-custom-session")
         )
 
@@ -410,14 +410,16 @@ class TestSessionCRUD:
 
         assert resp.status == 201
         assert data["session_id"] == "my-custom-session"
-        manager.create_session_with_worker_graph.assert_awaited_once_with(
+        manager.create_session_with_worker_colony.assert_awaited_once_with(
             str(EXAMPLE_AGENT_PATH.resolve()),
             agent_id=None,
             session_id="my-custom-session",
             model=None,
             initial_prompt=None,
             queen_resume_from=None,
+            queen_name=None,
             initial_phase=None,
+            worker_name=None,
         )
 
     @pytest.mark.asyncio
@@ -581,50 +583,40 @@ class TestSessionCRUD:
 
 class TestMessageBootstrap:
     @pytest.mark.asyncio
-    async def test_new_message_requires_non_empty_message(self):
+    async def test_classify_requires_non_empty_message(self):
         app = create_app()
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post("/api/messages/new", json={"message": "   "})
+            resp = await client.post("/api/messages/classify", json={"message": "   "})
             assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_new_message_selects_queen_and_creates_fresh_session(self, monkeypatch):
+    async def test_classify_returns_queen_id_without_touching_sessions(self, monkeypatch):
         app = create_app()
         manager = app["manager"]
+        # Pre-existing live session must NOT be stopped by classify.
         existing = _make_session(agent_id="live_session")
         existing.queen_name = "queen_growth"
         manager._sessions[existing.id] = existing
         manager.build_llm = MagicMock(return_value=MagicMock())
-        manager.stop_session = AsyncMock(side_effect=lambda sid: manager._sessions.pop(sid, None))
-        created = _make_session(agent_id="fresh_queen_session", with_queen=False)
-        created.queen_name = "queen_technology"
-        manager.create_session = AsyncMock(return_value=created)
+        manager.stop_session = AsyncMock()
+        manager.create_session = AsyncMock()
         monkeypatch.setattr(
             routes_messages, "select_queen", AsyncMock(return_value="queen_technology")
         )
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post("/api/messages/new", json={"message": "Build me a scraper"})
+            resp = await client.post(
+                "/api/messages/classify", json={"message": "Build me a scraper"}
+            )
             assert resp.status == 200
             data = await resp.json()
-
-        assert data == {
-            "queen_id": "queen_technology",
-            "session_id": "fresh_queen_session",
-        }
-        routes_messages.select_queen.assert_awaited_once()
-        manager.stop_session.assert_awaited_once_with("live_session")
-        manager.create_session.assert_awaited_once_with(
-            initial_prompt="Build me a scraper",
-            queen_name="queen_technology",
-            initial_phase="independent",
-        )
-        published_event = created.event_bus.publish.await_args.args[0]
-        assert published_event.type.value == "client_input_received"
-        assert published_event.stream_id == "queen"
-        assert published_event.node_id == "queen"
-        assert published_event.execution_id == "fresh_queen_session"
-        assert published_event.data == {"content": "Build me a scraper", "image_count": 0}
+            # Assert inside the async-with so app shutdown (which stops
+            # sessions as cleanup) doesn't pollute the assertions.
+            assert data == {"queen_id": "queen_technology"}
+            routes_messages.select_queen.assert_awaited_once()
+            manager.stop_session.assert_not_awaited()
+            manager.create_session.assert_not_awaited()
+            assert "live_session" in manager._sessions
 
 
 class TestQueenSessionSelection:
@@ -727,7 +719,7 @@ class TestQueenSessionSelection:
         manager.stop_session = AsyncMock()
         restored = _make_session(agent_id="worker_history", with_queen=False)
         restored.queen_name = "queen_technology"
-        manager.create_session_with_worker_graph = AsyncMock(return_value=restored)
+        manager.create_session_with_worker_colony = AsyncMock(return_value=restored)
         manager.create_session = AsyncMock()
 
         async with TestClient(TestServer(app)) as client:
@@ -743,7 +735,7 @@ class TestQueenSessionSelection:
             "queen_id": "queen_technology",
             "status": "resumed",
         }
-        manager.create_session_with_worker_graph.assert_awaited_once_with(
+        manager.create_session_with_worker_colony.assert_awaited_once_with(
             str(EXAMPLE_AGENT_PATH.resolve()),
             queen_resume_from="worker_history",
             initial_prompt=None,
@@ -875,7 +867,7 @@ class TestExecution:
     async def test_chat_prefers_queen_even_when_node_waiting(self):
         """When the queen is alive, /chat routes to queen even if a node is waiting."""
         session = _make_session()
-        session.graph_runtime.find_awaiting_node = lambda: ("chat_node", "primary")
+        session.colony_runtime.find_awaiting_node = lambda: ("chat_node", "primary")
         app = _make_app_with_session(session)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -991,7 +983,7 @@ class TestResume:
         tmp_path, agent_name, base = tmp_agent_dir
 
         session = _make_session(tmp_dir=tmp_path / ".hive" / "agents" / agent_name)
-        session.graph_runtime.trigger = AsyncMock(return_value="exec_test_123")
+        session.colony_runtime.trigger = AsyncMock(return_value="exec_test_123")
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
@@ -1005,7 +997,7 @@ class TestResume:
             assert resp.status == 200
             data = await resp.json()
             assert data["checkpoint_id"] == "cp_node_complete_node_a_001"
-            _, kwargs = session.graph_runtime.trigger.await_args
+            _, kwargs = session.colony_runtime.trigger.await_args
             assert kwargs["session_state"]["run_id"] == "__legacy_run__"
 
     @pytest.mark.asyncio
@@ -1036,7 +1028,7 @@ class TestStop:
     async def test_stop_found(self):
         session = _make_session()
         # Put a mock task in the stream so cancel_execution returns True
-        session.graph_runtime._mock_streams["default"]._execution_tasks["exec_abc"] = MagicMock()
+        session.colony_runtime._mock_streams["default"]._execution_tasks["exec_abc"] = MagicMock()
         app = _make_app_with_session(session)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -1077,7 +1069,7 @@ class TestReplay:
         tmp_path, agent_name, base = tmp_agent_dir
 
         session = _make_session(tmp_dir=tmp_path / ".hive" / "agents" / agent_name)
-        session.graph_runtime.trigger = AsyncMock(return_value="exec_test_123")
+        session.colony_runtime.trigger = AsyncMock(return_value="exec_test_123")
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
@@ -1092,7 +1084,7 @@ class TestReplay:
             data = await resp.json()
             assert data["execution_id"] == "exec_test_123"
             assert data["replayed_from"] == session_id
-            _, kwargs = session.graph_runtime.trigger.await_args
+            _, kwargs = session.colony_runtime.trigger.await_args
             assert kwargs["session_state"]["run_id"] == "__legacy_run__"
 
     @pytest.mark.asyncio
@@ -1330,7 +1322,7 @@ class TestLogs:
     async def test_logs_no_log_store(self):
         """Agent without log store returns 404."""
         session = _make_session()
-        session.graph_runtime._runtime_log_store = None
+        session.colony_runtime._runtime_log_store = None
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:

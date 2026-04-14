@@ -1,4 +1,5 @@
 import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { Link } from "react-router-dom";
 import {
   Send,
   Square,
@@ -40,7 +41,8 @@ export interface ChatMessage {
     | "user"
     | "tool_status"
     | "worker_input_request"
-    | "run_divider";
+    | "run_divider"
+    | "colony_link";
   role?: "queen" | "worker";
   /** Which worker thread this message belongs to (worker agent name) */
   thread?: string;
@@ -54,6 +56,8 @@ export interface ChatMessage {
   nodeId?: string;
   /** Backend execution_id for this message */
   executionId?: string;
+  /** True when the message was sent while the queen was still processing */
+  queued?: boolean;
 }
 
 interface ChatPanelProps {
@@ -91,6 +95,8 @@ interface ChatPanelProps {
   showQueenPhaseBadge?: boolean;
   /** Context window usage for queen and workers */
   contextUsage?: Record<string, ContextUsageEntry>;
+  /** One-shot composer prefill. Applied to the textarea whenever the value changes. */
+  initialDraft?: string | null;
 }
 
 const queenColor = "hsl(45,95%,58%)";
@@ -242,6 +248,42 @@ const MessageBubble = memo(
       );
     }
 
+    if (msg.type === "colony_link") {
+      // Rendered when the queen calls create_colony() and the backend
+      // emits a COLONY_CREATED event. Gives the user a clickable card
+      // that navigates to the new colony page.
+      let parsed: {
+        colony_name?: string;
+        is_new?: boolean;
+        skill_name?: string;
+        href?: string;
+      } = {};
+      try {
+        parsed = JSON.parse(msg.content);
+      } catch {
+        // ignore — fall through to a plain text render
+      }
+      const colonyName = parsed.colony_name || "";
+      const href = parsed.href || (colonyName ? `/colony/${colonyName}` : "");
+      const skillLabel = parsed.skill_name
+        ? ` · skill: ${parsed.skill_name}`
+        : "";
+      const isNewLabel = parsed.is_new === false ? " (updated)" : " (new)";
+      return (
+        <div className="flex justify-center py-2">
+          <Link
+            to={href}
+            className="inline-flex items-center gap-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 px-4 py-2 rounded-full border border-primary/20 transition-colors"
+          >
+            <span>🏛️</span>
+            <span>
+              Colony <strong>{colonyName}</strong>{isNewLabel} ready{skillLabel} — open
+            </span>
+          </Link>
+        </div>
+      );
+    }
+
     if (msg.type === "tool_status") {
       return <ToolActivityRow content={msg.content} />;
     }
@@ -249,7 +291,9 @@ const MessageBubble = memo(
     if (isUser) {
       return (
         <div className="flex justify-end">
-          <div className="max-w-[75%] bg-primary text-primary-foreground text-sm leading-relaxed rounded-2xl rounded-br-md px-4 py-3">
+          <div
+            className={`max-w-[75%] bg-primary text-primary-foreground text-sm leading-relaxed rounded-2xl rounded-br-md px-4 py-3${msg.queued ? " animate-pulse opacity-80" : ""}`}
+          >
             {msg.images && msg.images.length > 0 && (
               <div className="flex flex-wrap gap-2 mb-2">
                 {msg.images.map((img, i) => (
@@ -264,6 +308,11 @@ const MessageBubble = memo(
             )}
             {msg.content && (
               <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+            )}
+            {msg.queued && (
+              <span className="block text-[10px] opacity-60 mt-1 text-right">
+                queued
+              </span>
             )}
           </div>
         </div>
@@ -356,6 +405,7 @@ export default function ChatPanel({
   showQueenPhaseBadge = true,
   contextUsage,
   supportsImages = true,
+  initialDraft,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<ImageContent[]>([]);
@@ -365,6 +415,21 @@ export default function ChatPanel({
   const stickToBottom = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const lastAppliedDraftRef = useRef<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!initialDraft || initialDraft === lastAppliedDraftRef.current) return;
+    lastAppliedDraftRef.current = initialDraft;
+    setInput(initialDraft);
+    setTimeout(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+      ta.selectionStart = ta.selectionEnd = ta.value.length;
+    }, 0);
+  }, [initialDraft]);
 
   const threadMessages = messages.filter((m) => {
     if (m.type === "system" && !m.thread) return false;

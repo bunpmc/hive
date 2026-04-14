@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useState, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { Loader2, Send } from "lucide-react";
 import { messagesApi } from "@/api/messages";
 import { useColony } from "@/context/ColonyContext";
@@ -13,38 +13,26 @@ const promptHints = [
 
 export default function Home() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { userProfile, refresh } = useColony();
   const [inputValue, setInputValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [activePrompt, setActivePrompt] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Pre-fill input if navigated from Prompt Library with a prompt
-  useEffect(() => {
-    const state = location.state as { prompt?: string } | null;
-    if (state?.prompt) {
-      setInputValue(state.prompt);
-      // Clear the state so refreshing doesn't re-fill
-      navigate(location.pathname, { replace: true });
-      // Focus and resize textarea
-      setTimeout(() => {
-        textareaRef.current?.focus();
-        textareaRef.current?.dispatchEvent(new Event("input", { bubbles: true }));
-      }, 0);
-    }
-  }, [location.state, location.pathname, navigate]);
-
   const displayName = userProfile.displayName || "there";
 
   const startQueenSession = async (text: string) => {
-    if (!text.trim() || submitting) return;
+    const trimmed = text.trim();
+    if (!trimmed || submitting) return;
     setSubmitting(true);
-    setActivePrompt(text.trim());
+    setActivePrompt(trimmed);
     try {
-      const result = await messagesApi.newMessage(text.trim());
+      const { queen_id } = await messagesApi.classify(trimmed);
+      // Hand the first message to queen-dm via sessionStorage so it
+      // survives the navigation without leaking into the URL/history.
+      sessionStorage.setItem(`queenFirstMessage:${queen_id}`, trimmed);
       refresh();
-      navigate(`/queen/${result.queen_id}?session=${encodeURIComponent(result.session_id)}`);
+      navigate(`/queen/${queen_id}?new=1`);
     } catch {
       // Keep the user on home if bootstrap fails.
     } finally {
@@ -54,7 +42,15 @@ export default function Home() {
   };
 
   const handlePromptHint = (text: string) => {
-    void startQueenSession(text);
+    setInputValue(text);
+    setTimeout(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+      ta.selectionStart = ta.selectionEnd = ta.value.length;
+    }, 0);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -123,16 +119,7 @@ export default function Home() {
               disabled={submitting}
               className="text-xs text-muted-foreground hover:text-foreground border border-border/50 hover:border-primary/30 rounded-full px-3.5 py-1.5 transition-all hover:bg-primary/[0.03] disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              <span className="inline-flex items-center gap-1.5">
-                {submitting && activePrompt === hint ? (
-                  <>
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    Connecting...
-                  </>
-                ) : (
-                  hint
-                )}
-              </span>
+              {hint}
             </button>
           ))}
         </div>

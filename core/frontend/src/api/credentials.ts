@@ -8,6 +8,14 @@ export interface CredentialInfo {
   updated_at: string | null;
 }
 
+export interface CredentialAccount {
+  provider: string;
+  alias: string;
+  identity: Record<string, string>;
+  source: "aden" | "local" | string;
+  credential_id: string;
+}
+
 export interface CredentialSpec {
   credential_name: string;
   credential_id: string;
@@ -21,6 +29,12 @@ export interface CredentialSpec {
   credential_key: string;
   credential_group: string;
   available: boolean;
+  accounts: CredentialAccount[];
+}
+
+export interface ResyncResponse {
+  synced: boolean;
+  accounts_by_provider: Record<string, CredentialAccount[]>;
 }
 
 export interface AgentCredentialRequirement {
@@ -63,5 +77,14 @@ export const credentialsApi = {
     api.post<{ required: AgentCredentialRequirement[]; has_aden_key: boolean }>(
       "/credentials/check-agent",
       { agent_path: agentPath },
+    ),
+
+  resync: () =>
+    api.post<ResyncResponse>("/credentials/resync", {}),
+
+  validateKey: (providerId: string, apiKey: string) =>
+    api.post<{ valid: boolean | null; message: string }>(
+      "/credentials/validate-key",
+      { provider_id: providerId, api_key: apiKey },
     ),
 };

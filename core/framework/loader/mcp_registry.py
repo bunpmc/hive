@@ -36,6 +36,32 @@ _DEFAULT_CONFIG = {
     "refresh_interval_hours": DEFAULT_REFRESH_INTERVAL_HOURS,
 }
 
+# Default local MCP servers that ship with Hive. Seeded on first startup so
+# fresh users get working file I/O, browser automation, and the hive tool
+# suite without having to run `hive mcp add` manually. ``cwd`` is filled in
+# at registration time with the absolute path to the ``tools/`` directory.
+_DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
+    "hive_tools": {
+        "description": "Hive tools: web search, email, CRM, calendar, and 100+ integrations",
+        "args": ["run", "python", "mcp_server.py", "--stdio"],
+    },
+    "gcu-tools": {
+        "description": "Browser automation: click, type, navigate, screenshot, snapshot",
+        "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+    },
+    "files-tools": {
+        "description": "File I/O: read, write, edit, search, list, run commands",
+        "args": ["run", "python", "files_server.py", "--stdio"],
+    },
+}
+
+# Aliases that earlier versions of ensure_defaults wrote under the wrong name.
+# When we see one of these stale entries, drop it before seeding the canonical
+# name so the active agents (queen, credential_tester) can find their tools.
+_STALE_DEFAULT_ALIASES: dict[str, str] = {
+    "hive_tools": "hive-tools",
+}
+
 
 class MCPRegistry:
     """Manages local MCP server state in ~/.hive/mcp_registry/."""
@@ -58,6 +84,69 @@ class MCPRegistry:
 
         if not self._installed_path.exists():
             self._write_json(self._installed_path, {"servers": {}})
+
+    def ensure_defaults(self) -> list[str]:
+        """Seed the built-in local MCP servers (hive-tools, gcu-tools, files-tools).
+
+        Idempotent — servers already present are left untouched. Skips seeding
+        entirely when the source-tree ``tools/`` directory cannot be located
+        (e.g. when Hive is installed from a wheel rather than a checkout).
+
+        Returns the list of names that were newly registered.
+        """
+        self.initialize()
+
+        # parents: [0]=loader, [1]=framework, [2]=core, [3]=repo root
+        tools_dir = Path(__file__).resolve().parents[3] / "tools"
+        if not tools_dir.is_dir():
+            logger.debug(
+                "MCPRegistry.ensure_defaults: tools dir %s missing; skipping default seed",
+                tools_dir,
+            )
+            return []
+
+        cwd = str(tools_dir)
+        data = self._read_installed()
+        existing = data.get("servers", {})
+        added: list[str] = []
+
+        # Drop stale aliases (from earlier versions that wrote the wrong name).
+        # Only remove the alias when the canonical name isn't already installed,
+        # so we never clobber a hand-edited entry the user cares about.
+        mutated = False
+        for canonical, stale in _STALE_DEFAULT_ALIASES.items():
+            if stale in existing and canonical not in existing:
+                logger.info(
+                    "MCPRegistry.ensure_defaults: removing stale alias '%s' (canonical: '%s')",
+                    stale,
+                    canonical,
+                )
+                del existing[stale]
+                mutated = True
+        if mutated:
+            self._write_installed(data)
+
+        for name, spec in _DEFAULT_LOCAL_SERVERS.items():
+            if name in existing:
+                continue
+            try:
+                self.add_local(
+                    name=name,
+                    transport="stdio",
+                    command="uv",
+                    args=list(spec["args"]),
+                    cwd=cwd,
+                    description=spec["description"],
+                )
+                added.append(name)
+            except MCPError as exc:
+                logger.warning(
+                    "MCPRegistry.ensure_defaults: failed to seed '%s': %s", name, exc
+                )
+
+        if added:
+            logger.info("MCPRegistry: seeded default local servers: %s", added)
+        return added
 
     # ── Internal I/O ────────────────────────────────────────────────
 

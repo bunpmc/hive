@@ -169,7 +169,7 @@ async def handle_health(request: web.Request) -> web.Response:
         {
             "status": "ok",
             "sessions": len(sessions),
-            "agents_loaded": sum(1 for s in sessions if s.graph_runtime is not None),
+            "agents_loaded": sum(1 for s in sessions if s.colony_runtime is not None),
         }
     )
 
@@ -263,6 +263,7 @@ def create_app(model: str | None = None) -> web.Application:
 
         registry = MCPRegistry()
         registry.initialize()
+        registry.ensure_defaults()
         if (queen_pkg_dir / "mcp_registry.json").is_file():
             _queen_tool_registry.set_mcp_registry_agent_path(queen_pkg_dir)
         registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
@@ -296,7 +297,7 @@ def create_app(model: str | None = None) -> web.Application:
     from framework.server.routes_credentials import register_routes as register_credential_routes
     from framework.server.routes_events import register_routes as register_event_routes
     from framework.server.routes_execution import register_routes as register_execution_routes
-    from framework.server.routes_graphs import register_routes as register_graph_routes
+    from framework.server.routes_workers import register_routes as register_worker_routes
     from framework.server.routes_logs import register_routes as register_log_routes
     from framework.server.routes_messages import register_routes as register_message_routes
     from framework.server.routes_queens import register_routes as register_queen_routes
@@ -308,7 +309,7 @@ def create_app(model: str | None = None) -> web.Application:
     register_event_routes(app)
     register_message_routes(app)
     register_session_routes(app)
-    register_graph_routes(app)
+    register_worker_routes(app)
     register_log_routes(app)
     register_queen_routes(app)
 

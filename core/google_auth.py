@@ -274,15 +274,19 @@ def save_accounts(data: dict[str, Any]) -> None:
 
 
 def validate_credentials(access_token: str) -> bool:
-    """Test if credentials work by making a simple API call to Cloud Code Assist.
+    """Test if credentials work by calling :loadCodeAssist on Cloud Code Assist.
 
-    Returns True if credentials are valid, False otherwise.
+    Uses :loadCodeAssist rather than :generateContent because the latter
+    requires a fully onboarded ``project`` + ``user_prompt_id`` in the body
+    (see GoogleGeminiCliProvider) and costs model quota. :loadCodeAssist
+    only inspects the account and returns 200 for any valid OAuth token —
+    which is exactly the signal we want here.
     """
     body = json.dumps({
-        "model": "models/gemini-3-flash-preview",
-        "request": {
-            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-            "generationConfig": {"maxOutputTokens": 10},
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
         },
     }).encode("utf-8")
 
@@ -293,7 +297,7 @@ def validate_credentials(access_token: str) -> bool:
 
     try:
         req = urllib.request.Request(
-            "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
             data=body,
             headers=headers,
             method="POST",

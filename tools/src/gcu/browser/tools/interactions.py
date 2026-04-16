@@ -174,6 +174,125 @@ def register_interaction_tools(mcp: FastMCP) -> None:
             return result
 
     @mcp.tool()
+    async def browser_click_image(
+        image_x: float,
+        image_y: float,
+        tab_id: int | None = None,
+        profile: str | None = None,
+        button: Literal["left", "right", "middle"] = "left",
+    ) -> dict:
+        """
+        Click at coordinates read directly from the most recent screenshot.
+
+        **Use this after ``browser_screenshot`` when you've eyeballed a
+        target pixel from the returned image.** It reads the cached
+        image→CSS scale for the tab and converts automatically — so you
+        pass in the raw image pixel you saw, not a pre-converted CSS px.
+        This is the canonical screenshot-then-click path and eliminates
+        the single most common coordinate bug (passing 800-px-scale
+        numbers to a 1717-px-scale CDP API, which lands the click on a
+        sidebar instead of the target).
+
+        Pipeline:
+
+            img = browser_screenshot()           # image (default 800 px wide)
+            # look at img, pick a target pixel (x, y)
+            browser_click_image(x, y)            # auto-converts to CSS px
+
+        If you already hold CSS coordinates (from ``getBoundingClientRect``,
+        ``browser_get_rect``, or an explicit ``browser_coords`` call), use
+        ``browser_click_coordinate`` instead — that path does no conversion.
+
+        Fails fast if no screenshot scale is cached for the tab (call
+        ``browser_screenshot`` first so the scale is known).
+
+        Args:
+            image_x: X coordinate in image pixels (the value you read off
+                the screenshot PNG).
+            image_y: Y coordinate in image pixels.
+            tab_id: Chrome tab ID (default: active tab).
+            profile: Browser profile name (default: "default").
+            button: Mouse button to click (left, right, middle).
+
+        Returns:
+            Dict with click result, including the converted ``css_x`` /
+            ``css_y`` that were actually dispatched and the ``cssScale``
+            used for the conversion.
+        """
+        start = time.perf_counter()
+        params = {
+            "image_x": image_x,
+            "image_y": image_y,
+            "tab_id": tab_id,
+            "profile": profile,
+            "button": button,
+        }
+
+        bridge = get_bridge()
+        if not bridge or not bridge.is_connected:
+            result = {"ok": False, "error": "Browser extension not connected"}
+            log_tool_call("browser_click_image", params, result=result)
+            return result
+
+        ctx = _get_context(profile)
+        if not ctx:
+            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            log_tool_call("browser_click_image", params, result=result)
+            return result
+
+        target_tab = tab_id or ctx.get("activeTabId")
+        if target_tab is None:
+            result = {"ok": False, "error": "No active tab"}
+            log_tool_call("browser_click_image", params, result=result)
+            return result
+
+        from .inspection import _screenshot_css_scales
+
+        css_scale = _screenshot_css_scales.get(target_tab)
+        if css_scale is None:
+            result = {
+                "ok": False,
+                "error": (
+                    f"No screenshot scale cached for tab {target_tab}. "
+                    "Call browser_screenshot first so the image→CSS scale "
+                    "is known, or use browser_click_coordinate if you "
+                    "already have CSS px."
+                ),
+            }
+            log_tool_call("browser_click_image", params, result=result)
+            return result
+
+        css_x = image_x * css_scale
+        css_y = image_y * css_scale
+
+        try:
+            click_result = await bridge.click_coordinate(target_tab, css_x, css_y, button=button)
+            enriched = {
+                **click_result,
+                "input_image_x": image_x,
+                "input_image_y": image_y,
+                "converted_css_x": css_x,
+                "converted_css_y": css_y,
+                "cssScale": css_scale,
+            }
+            log_tool_call(
+                "browser_click_image",
+                params,
+                result=enriched,
+                duration_ms=(time.perf_counter() - start) * 1000,
+            )
+            return enriched
+        except Exception as e:
+            result = {"ok": False, "error": str(e)}
+            log_tool_call(
+                "browser_click_image",
+                params,
+                error=e,
+                duration_ms=(time.perf_counter() - start) * 1000,
+            )
+            return result
+
+    @mcp.tool()
     async def browser_type(
         selector: str,
         text: str,

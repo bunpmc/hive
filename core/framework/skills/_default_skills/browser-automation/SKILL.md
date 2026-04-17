@@ -40,6 +40,22 @@ Never feed `physical_x/y` to any click tool. On a DPR=1.6 display, physical coor
 
 `getBoundingClientRect()` already returns CSS pixels — feed those straight into `browser_click_coordinate` (not `browser_click_image`) without any scaling.
 
+### The naming convention
+
+Every coord-returning tool (`browser_coords`, `browser_get_rect`, `browser_shadow_query`) returns parallel blocks — one per coord space. Match the block name to the click tool suffix:
+
+```
+rect = browser_get_rect(selector)
+# rect.image  → browser_click_image     ← preferred after a screenshot (scale cached)
+# rect.css    → browser_click_coordinate  (hover_coordinate / press_at)
+# rect.physical  → DO NOT click — debug only
+
+browser_click_image(rect.image.cx, rect.image.cy)
+browser_click_coordinate(rect.css.cx, rect.css.cy)
+```
+
+Same shape from `browser_shadow_query` (`sq.image`, `sq.css`, `sq.physical`) and `browser_coords` (`image_x/image_y`, `css_x/css_y`, `physical_x/physical_y`). If the block prefix and the tool suffix don't match, you're about to click the wrong place.
+
 **Exception for zoomed elements:** pages that use `zoom` or `transform: scale()` on a container (LinkedIn's `#interop-outlet`, some embedded iframes) render in a scaled local coordinate space. `getBoundingClientRect` there may not match CDP's hit space. Use `browser_shadow_query` which handles the math, or fall back to visually picking coordinates from a screenshot.
 
 ## Screenshot + coordinates is shadow-agnostic — prefer it on shadow-heavy sites
@@ -168,7 +184,7 @@ The symptom is always the same: **you type, the characters appear visually, and 
 ```
 # 1. Focus the real element via a real click (not JS .focus()).
 rect = browser_get_rect(selector)             # or browser_shadow_query for shadow sites
-browser_click_coordinate(rect.cx, rect.cy)
+browser_click_coordinate(rect.css.cx, rect.css.cy)   # rect.css.cx/cy — matched pair
 sleep(0.5)                                     # let the editor open / focus settle
 
 # 2. Type. browser_type now uses CDP Input.insertText by default, which is
@@ -197,7 +213,7 @@ if not state['disabled']:
 else:
     # Recovery: sometimes a click-again + one extra keystroke nudges
     # React into recomputing hasRealContent.
-    browser_click_coordinate(rect.cx, rect.cy)
+    browser_click_coordinate(rect.css.cx, rect.css.cy)   # rect.css.cx/cy — matched pair
     browser_press("End")
     browser_press(" ")
     browser_press("Backspace")
@@ -353,7 +369,7 @@ LinkedIn enforces **strict Trusted Types CSP**. Any script you inject via `brows
 Reddit's search input lives **two shadow levels deep** inside `reddit-search-large > faceplate-search-input`. You cannot reach it with `browser_type(selector=)`. The working pattern:
 
 1. `browser_shadow_query("reddit-search-large >>> #search-input")` → rect
-2. `browser_click_coordinate(rect.cx, rect.cy)` → click lands on the real shadow input via native hit testing; input becomes focused
+2. `browser_click_coordinate(rect.css.cx, rect.css.cy)   # rect.css.cx/cy — matched pair` → click lands on the real shadow input via native hit testing; input becomes focused
 3. `browser_press(c)` for each character → dispatches to focused element
 4. Verify by reading `.value` via `browser_evaluate` walking the shadow path
 
@@ -476,7 +492,7 @@ browser_navigate("https://x.com/explore", wait_until="load")
 sleep(3)
 browser_wait_for_selector("input[data-testid='SearchBox_Search_Input']", timeout_ms=5000)
 rect = browser_get_rect("input[data-testid='SearchBox_Search_Input']")
-browser_click_coordinate(rect.cx, rect.cy)
+browser_click_coordinate(rect.css.cx, rect.css.cy)   # rect.css.cx/cy — matched pair
 browser_type("input[data-testid='SearchBox_Search_Input']", "openai", clear_first=True)
 # Screenshot now shows live search suggestions
 browser_screenshot()
@@ -490,7 +506,7 @@ browser_navigate("https://www.reddit.com/r/programming/", wait_until="load")
 sleep(2)
 # Shadow-pierce the nested search input
 sq = browser_shadow_query("reddit-search-large >>> #search-input")
-browser_click_coordinate(sq.rect.cx, sq.rect.cy)
+browser_click_coordinate(sq.css.cx, sq.css.cy)   # sq.css.cx/cy — matched pair
 # Typing can't use selector (shadow); focused input receives raw key presses
 for c in "python":
     browser_press(c)
@@ -505,7 +521,7 @@ browser_navigate("https://www.linkedin.com/feed/", wait_until="load", timeout_ms
 sleep(3)
 browser_wait_for_selector("input[data-testid='typeahead-input']", timeout_ms=5000)
 rect = browser_get_rect("input[data-testid='typeahead-input']")
-browser_click_coordinate(rect.cx, rect.cy)
+browser_click_coordinate(rect.css.cx, rect.css.cy)   # rect.css.cx/cy — matched pair
 browser_type("input[data-testid='typeahead-input']", "anthropic", clear_first=True)
 # Dropdown shows real live suggestions
 browser_screenshot()

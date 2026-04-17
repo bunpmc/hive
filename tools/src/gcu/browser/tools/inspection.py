@@ -379,7 +379,14 @@ def register_inspection_tools(mcp: FastMCP) -> None:
 
         return {
             "ok": True,
-            # Primary output: CSS pixels. Feed these to click/hover/press.
+            # Echo the input — you can feed these straight into
+            # browser_click_image, which does the image→CSS conversion
+            # internally. This is the simpler path when you just read a
+            # pixel off a screenshot.
+            "image_x": round(x, 1),
+            "image_y": round(y, 1),
+            # CSS pixels — feed these to browser_click_coordinate /
+            # hover_coordinate / press_at, which expect CSS px.
             "css_x": round(x * css_scale, 1),
             "css_y": round(y * css_scale, 1),
             # Debug output: raw physical pixels. DO NOT feed to clicks on
@@ -392,12 +399,11 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             "cssScale": css_scale,
             "tabId": target_tab,
             "note": (
-                "Use css_x/css_y with browser_click_coordinate, "
-                "browser_hover_coordinate, browser_press_at — "
-                "Chrome DevTools Protocol Input.dispatchMouseEvent "
-                "operates in CSS pixels. physical_x/y is for debugging "
-                "on HiDPI displays only; feeding it to clicks lands "
-                "them at DPR× the intended coordinate."
+                "Simpler path: skip browser_coords entirely and call "
+                "browser_click_image(image_x, image_y) — it does the "
+                "conversion automatically. Use css_x/css_y only if you "
+                "need to pass coords to browser_click_coordinate / "
+                "hover_coordinate / press_at. physical_x/y is debug-only."
             ),
         }
 
@@ -412,7 +418,8 @@ def register_inspection_tools(mcp: FastMCP) -> None:
 
         Traverses shadow roots to find elements inside closed/open shadow DOM,
         overlays, and virtual-rendered components (e.g. LinkedIn's #interop-outlet).
-        Returns getBoundingClientRect in both CSS and physical pixels.
+        Returns getBoundingClientRect in image, CSS, and physical pixels —
+        pass the matching block into the matching click tool.
 
         Args:
             selector: CSS selectors joined by ' >>> ' to pierce shadow roots.
@@ -421,7 +428,9 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with rect (CSS px) and physical rect (CSS px × DPR) of the element
+            Dict with ``image`` (pass to browser_click_image), ``css``
+            (pass to browser_click_coordinate / hover / press_at), and
+            ``physical`` (debug only).
         """
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -441,11 +450,21 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         physical_scale = _screenshot_scales.get(target_tab, 1.0)
         css_scale = _screenshot_css_scales.get(target_tab, 1.0)
         dpr = physical_scale / css_scale if css_scale else 1.0
+        # image = css / cssScale — inverse of the conversion browser_click_image does
+        inv_css = 1.0 / css_scale if css_scale else 1.0
 
         return {
             "ok": True,
             "selector": selector,
             "tag": rect.get("tag"),
+            "image": {
+                "x": round(rect["x"] * inv_css, 1),
+                "y": round(rect["y"] * inv_css, 1),
+                "w": round(rect["w"] * inv_css, 1),
+                "h": round(rect["h"] * inv_css, 1),
+                "cx": round(rect["cx"] * inv_css, 1),
+                "cy": round(rect["cy"] * inv_css, 1),
+            },
             "css": {
                 "x": rect["x"],
                 "y": rect["y"],
@@ -462,12 +481,14 @@ def register_inspection_tools(mcp: FastMCP) -> None:
                 "cx": round(rect["cx"] * dpr, 1),
                 "cy": round(rect["cy"] * dpr, 1),
             },
+            "cssScale": css_scale,
             "note": (
-                "Use css.cx/cy with browser_click_coordinate, "
-                "browser_hover_coordinate, browser_press_at — "
-                "CDP Input events operate in CSS pixels. "
-                "physical.* is debug-only; feeding it to clicks "
-                "lands them DPR× too far on HiDPI displays."
+                "Pass image.cx/cy → browser_click_image (preferred after a "
+                "screenshot). Pass css.cx/cy → browser_click_coordinate / "
+                "hover_coordinate / press_at. physical.* is debug-only; "
+                "feeding it to clicks lands them DPR× too far on HiDPI. "
+                "If cssScale=1.0 no screenshot is cached yet — take a "
+                "browser_screenshot first if you want to use image coords."
             ),
         }
 
@@ -481,10 +502,12 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         Get the bounding rect of an element by CSS selector.
 
         Supports '>>>' shadow-piercing selectors for overlay/shadow DOM content.
-        Returns coordinates in CSS pixels (for clicks and DOM APIs); the
-        physical-pixel variant is returned for debugging on HiDPI displays
-        only — it must not be fed to click/hover/press tools, which use
-        CSS pixels.
+        Returns coordinates in image, CSS, and physical pixels. Pass the
+        ``image`` block into browser_click_image (preferred after a
+        screenshot) or the ``css`` block into browser_click_coordinate /
+        hover_coordinate / press_at. ``physical`` is debug-only and must
+        not be fed to click tools — CDP Input events use CSS pixels, not
+        physical pixels.
 
         Args:
             selector: CSS selector, optionally with ' >>> ' to pierce shadow roots.
@@ -493,7 +516,7 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with css and physical bounding rects
+            Dict with image, css, and physical bounding rects.
         """
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -513,11 +536,20 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         physical_scale = _screenshot_scales.get(target_tab, 1.0)
         css_scale = _screenshot_css_scales.get(target_tab, 1.0)
         dpr = physical_scale / css_scale if css_scale else 1.0
+        inv_css = 1.0 / css_scale if css_scale else 1.0
 
         return {
             "ok": True,
             "selector": selector,
             "tag": rect.get("tag"),
+            "image": {
+                "x": round(rect["x"] * inv_css, 1),
+                "y": round(rect["y"] * inv_css, 1),
+                "w": round(rect["w"] * inv_css, 1),
+                "h": round(rect["h"] * inv_css, 1),
+                "cx": round(rect["cx"] * inv_css, 1),
+                "cy": round(rect["cy"] * inv_css, 1),
+            },
             "css": {
                 "x": rect["x"],
                 "y": rect["y"],
@@ -534,12 +566,14 @@ def register_inspection_tools(mcp: FastMCP) -> None:
                 "cx": round(rect["cx"] * dpr, 1),
                 "cy": round(rect["cy"] * dpr, 1),
             },
+            "cssScale": css_scale,
             "note": (
-                "Use css.cx/cy with browser_click_coordinate, "
-                "browser_hover_coordinate, browser_press_at — "
-                "CDP Input events operate in CSS pixels. "
-                "physical.* is debug-only; feeding it to clicks "
-                "lands them DPR× too far on HiDPI displays."
+                "Pass image.cx/cy → browser_click_image (preferred after a "
+                "screenshot). Pass css.cx/cy → browser_click_coordinate / "
+                "hover_coordinate / press_at. physical.* is debug-only; "
+                "feeding it to clicks lands them DPR× too far on HiDPI. "
+                "If cssScale=1.0 no screenshot is cached yet — take a "
+                "browser_screenshot first if you want to use image coords."
             ),
         }
 

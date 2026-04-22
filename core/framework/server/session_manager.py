@@ -1516,6 +1516,12 @@ class SessionManager:
             tool_executor=queen_tool_executor,
             event_bus=session.event_bus,
             colony_id=session.id,
+            # Wire the on-disk colony name and queen id so
+            # ColonyRuntime auto-derives its override paths. DM sessions
+            # have no colony_name (session.colony_name is None), which
+            # keeps them out of the per-colony JSON store.
+            colony_name=getattr(session, "colony_name", None),
+            queen_id=getattr(session, "queen_name", None) or None,
             pipeline_stages=[],  # queen pipeline runs in queen_orchestrator, not here
         )
 
@@ -1738,6 +1744,42 @@ class SessionManager:
 
     def list_sessions(self) -> list[Session]:
         return list(self._sessions.values())
+
+    # ------------------------------------------------------------------
+    # Skill override helpers — used by routes_skills to find every live
+    # SkillsManager affected by a queen- or colony-scope mutation so a
+    # single HTTP call can reload them all.
+    # ------------------------------------------------------------------
+
+    def iter_queen_sessions(self, queen_id: str):
+        """Yield live sessions whose queen matches ``queen_id``."""
+        for s in self._sessions.values():
+            if getattr(s, "queen_name", None) == queen_id:
+                yield s
+
+    def iter_colony_runtimes(
+        self,
+        *,
+        queen_id: str | None = None,
+        colony_name: str | None = None,
+    ):
+        """Yield live ``ColonyRuntime`` instances matching the filters.
+
+        ``queen_id`` alone → every runtime whose ``queen_id`` matches
+        (useful when the user toggles a queen-scope skill — all her
+        colonies must reload).  ``colony_name`` alone → the single
+        runtime pinned to that colony.  Both → intersection. No filters
+        → every live runtime (used by global ``/api/skills`` reload).
+        """
+        for s in self._sessions.values():
+            colony = getattr(s, "colony", None)
+            if colony is None:
+                continue
+            if queen_id is not None and getattr(colony, "queen_id", None) != queen_id:
+                continue
+            if colony_name is not None and getattr(colony, "colony_name", None) != colony_name:
+                continue
+            yield colony
 
     # ------------------------------------------------------------------
     # Cold session helpers (disk-only, no live runtime required)

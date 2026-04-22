@@ -42,6 +42,7 @@ _HIVE_PATH_CONSUMERS = (
     "framework.server.session_manager",
     "framework.server.queen_orchestrator",
     "framework.server.routes_queens",
+    "framework.server.routes_skills",
     "framework.server.app",
     "framework.agents.discovery",
     "framework.agents.queen.queen_profiles",

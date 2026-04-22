@@ -1425,124 +1425,8 @@ def register_queen_lifecycle_tools(
     # re-runs idempotent.
 
     import re as _re
-    import shutil as _shutil
 
     _COLONY_NAME_RE = _re.compile(r"^[a-z0-9_]+$")
-    _SKILL_NAME_RE = _re.compile(r"^[a-z0-9-]+$")
-
-    def _materialize_skill_folder(
-        *,
-        skill_name: str,
-        skill_description: str,
-        skill_body: str,
-        skill_files: list[dict] | None,
-        colony_dir: Path,
-    ) -> tuple[Path | None, str | None, bool]:
-        """Write a skill folder under ``{colony_dir}/.hive/skills/{name}/`` from inline content.
-
-        The skill is scoped to a single colony: ``SkillDiscovery`` scans
-        ``{project_root}/.hive/skills/`` as project-scope, and the
-        colony's worker uses ``project_root = colony_dir`` — so only
-        that colony's workers see it, not every colony on the machine.
-        We deliberately avoid ``~/.hive/skills/`` here because that
-        directory is scanned as user scope and leaks into every agent.
-
-        Returns ``(installed_path, error, replaced)``. On success
-        ``error`` is ``None`` and ``installed_path`` is the final
-        location; ``replaced`` is ``True`` when an existing skill with
-        the same name was overwritten. On failure ``installed_path`` is
-        ``None``, ``error`` is a human-readable reason, and
-        ``replaced`` is ``False``.
-        """
-        name = (skill_name or "").strip() if isinstance(skill_name, str) else ""
-        if not name:
-            return None, "skill_name is required", False
-        if not _SKILL_NAME_RE.match(name):
-            return None, (f"skill_name '{name}' must match [a-z0-9-] pattern"), False
-        if name.startswith("-") or name.endswith("-") or "--" in name:
-            return None, (f"skill_name '{name}' has leading/trailing/consecutive hyphens"), False
-        if len(name) > 64:
-            return None, f"skill_name '{name}' exceeds 64 chars", False
-
-        desc = (skill_description or "").strip() if isinstance(skill_description, str) else ""
-        if not desc:
-            return None, "skill_description is required", False
-        if len(desc) > 1024:
-            return None, "skill_description must be 1–1024 chars", False
-        # Frontmatter descriptions must stay on a single line because
-        # our frontmatter parser is line-oriented and the downstream
-        # skill loader expects ``description:`` to resolve to one value.
-        if "\n" in desc or "\r" in desc:
-            return None, "skill_description must be a single line (no newlines)", False
-
-        body = skill_body if isinstance(skill_body, str) else ""
-        if not body.strip():
-            return (
-                None,
-                (
-                    "skill_body is required — the operational procedure the "
-                    "colony worker needs to run this job unattended"
-                ),
-                False,
-            )
-
-        # Optional supporting files (scripts/, references/, assets/…).
-        # Each entry: {"path": "<relative>", "content": "<text>"}.
-        normalized_files: list[tuple[Path, str]] = []
-        if skill_files:
-            if not isinstance(skill_files, list):
-                return None, "skill_files must be an array", False
-            for entry in skill_files:
-                if not isinstance(entry, dict):
-                    return None, "each skill_files entry must be an object with 'path' and 'content'", False
-                rel_raw = entry.get("path")
-                content = entry.get("content")
-                if not isinstance(rel_raw, str) or not rel_raw.strip():
-                    return None, "skill_files entry missing non-empty 'path'", False
-                if not isinstance(content, str):
-                    return None, f"skill_files entry '{rel_raw}' missing string 'content'", False
-                rel_stripped = rel_raw.strip()
-                # Normalize a leading ``./`` but do NOT strip bare ``/`` —
-                # an absolute path should be rejected, not silently relativized.
-                if rel_stripped.startswith("./"):
-                    rel_stripped = rel_stripped[2:]
-                rel_path = Path(rel_stripped)
-                if rel_stripped.startswith("/") or rel_path.is_absolute() or ".." in rel_path.parts:
-                    return None, (f"skill_files path '{rel_raw}' must be relative and inside the skill folder"), False
-                if rel_path.as_posix() == "SKILL.md":
-                    return None, ("skill_files must not contain SKILL.md — pass skill_body instead"), False
-                normalized_files.append((rel_path, content))
-
-        target_root = colony_dir / ".hive" / "skills"
-        target = target_root / name
-        try:
-            target_root.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            return None, f"failed to create skills root: {e}", False
-
-        replaced = False
-        try:
-            if target.exists():
-                # Queen is re-creating a skill under the same name —
-                # her latest content wins. rmtree first so stale files
-                # from a prior version don't linger alongside the new
-                # ones (copytree with dirs_exist_ok would merge them).
-                replaced = True
-                _shutil.rmtree(target)
-            target.mkdir(parents=True, exist_ok=False)
-
-            body_norm = body.rstrip() + "\n"
-            skill_md_text = f"---\nname: {name}\ndescription: {desc}\n---\n\n{body_norm}"
-            (target / "SKILL.md").write_text(skill_md_text, encoding="utf-8")
-
-            for rel_path, file_content in normalized_files:
-                full_path = target / rel_path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(file_content, encoding="utf-8")
-        except OSError as e:
-            return None, f"failed to write skill folder {target}: {e}", False
-
-        return target, None, replaced
 
     def _validate_triggers(raw: Any) -> tuple[list[dict] | None, str | None]:
         """Validate and normalize the ``triggers`` argument for create_colony.
@@ -1688,17 +1572,26 @@ def register_queen_lifecycle_tools(
         except OSError as e:
             return json.dumps({"error": f"failed to create colony dir {colony_dir}: {e}"})
 
-        installed_skill, skill_err, skill_replaced = _materialize_skill_folder(
+        # Validate + write via the shared authoring module so the HTTP
+        # routes and this tool stay in lockstep.
+        from framework.skills.authoring import build_draft, write_skill
+        from framework.skills.overrides import (
+            OverrideEntry,
+            Provenance,
+            SkillOverrideStore,
+            utc_now,
+        )
+
+        draft, draft_err = build_draft(
             skill_name=skill_name,
             skill_description=skill_description,
             skill_body=skill_body,
             skill_files=skill_files,
-            colony_dir=colony_dir,
         )
-        if skill_err is not None:
+        if draft_err is not None or draft is None:
             return json.dumps(
                 {
-                    "error": skill_err,
+                    "error": draft_err or "invalid skill draft",
                     "hint": (
                         "Provide skill_name (lowercase [a-z0-9-], ≤64 chars), "
                         "skill_description (single line, 1–1024 chars), and "
@@ -1710,6 +1603,40 @@ def register_queen_lifecycle_tools(
                     ),
                 }
             )
+
+        installed_skill, write_err, skill_replaced = write_skill(
+            draft,
+            target_root=colony_dir / ".hive" / "skills",
+            replace_existing=True,
+        )
+        if write_err is not None or installed_skill is None:
+            return json.dumps(
+                {
+                    "error": write_err or "failed to write skill folder",
+                }
+            )
+
+        # Register the write in the colony's override store so the UI can
+        # edit/toggle it and :func:`SkillsManager._apply_overrides` carries
+        # the right provenance.
+        try:
+            overrides_path = colony_dir / "skills_overrides.json"
+            store = SkillOverrideStore.load(overrides_path, scope_label=f"colony:{cn}")
+            queen_id = getattr(session, "queen_name", None) or "unknown"
+            store.upsert(
+                draft.name,
+                OverrideEntry(
+                    enabled=True,
+                    provenance=Provenance.QUEEN_CREATED,
+                    created_at=utc_now(),
+                    created_by=f"queen:{queen_id}",
+                ),
+            )
+            store.save()
+        except Exception:
+            # Registration is best-effort; discovery still surfaces the
+            # skill as project-scope even if the ledger fails to update.
+            logger.warning("create_colony: override registration failed", exc_info=True)
 
         logger.info(
             "create_colony: materialized skill at %s (replaced=%s)",

@@ -185,6 +185,8 @@ class ColonyRuntime:
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
         pipeline_stages: list | None = None,
+        queen_id: str | None = None,
+        colony_name: str | None = None,
     ):
         from framework.pipeline.runner import PipelineRunner
         from framework.skills.manager import SkillsManager
@@ -193,14 +195,27 @@ class ColonyRuntime:
         self._goal = goal
         self._config = config or ColonyConfig()
         self._runtime_log_store = runtime_log_store
+        self._queen_id: str | None = queen_id
+        # ``colony_id`` is the event-bus scope (session.id in DM sessions);
+        # ``colony_name`` is the on-disk identity under ~/.hive/colonies/.
+        # They coincide for forked colonies but diverge for queen DM
+        # sessions, so separate them explicitly.
+        self._colony_name: str | None = colony_name
 
         if pipeline_stages:
             self._pipeline = PipelineRunner(pipeline_stages)
         else:
             self._pipeline = self._load_pipeline_from_config()
 
-        if skills_manager_config is not None:
-            self._skills_manager = SkillsManager(skills_manager_config)
+        # Resolve per-colony override paths so UI toggles can reach this
+        # runtime. Callers that build their own SkillsManagerConfig stay
+        # in charge; bare construction auto-wires the standard paths.
+        _effective_cfg = skills_manager_config
+        if _effective_cfg is None and not (skills_catalog_prompt or protocols_prompt):
+            _effective_cfg = self._build_default_skills_config(colony_name, queen_id)
+
+        if _effective_cfg is not None:
+            self._skills_manager = SkillsManager(_effective_cfg)
             self._skills_manager.load()
         elif skills_catalog_prompt or protocols_prompt:
             import warnings
@@ -396,6 +411,92 @@ class ColonyRuntime:
         if not stages_config:
             return PipelineRunner([])
         return build_pipeline_from_config(stages_config)
+
+    @staticmethod
+    def _build_default_skills_config(
+        colony_name: str | None,
+        queen_id: str | None,
+    ) -> SkillsManagerConfig:
+        """Assemble a ``SkillsManagerConfig`` that wires in the per-colony /
+        per-queen override files and the ``queen_ui`` / ``colony_ui`` scope
+        dirs based on the standard ``~/.hive`` layout.
+
+        ``colony_name`` must be an actual on-disk colony name
+        (``~/.hive/colonies/{name}/``). DM sessions where the ``colony_id``
+        is a session UUID should pass ``None`` so we don't create a stray
+        override file under a session identifier.
+        """
+        from framework.config import COLONIES_DIR, QUEENS_DIR
+        from framework.skills.discovery import ExtraScope
+        from framework.skills.manager import SkillsManagerConfig
+
+        extras: list[ExtraScope] = []
+        queen_overrides_path: Path | None = None
+        if queen_id:
+            queen_home = QUEENS_DIR / queen_id
+            queen_overrides_path = queen_home / "skills_overrides.json"
+            extras.append(
+                ExtraScope(directory=queen_home / "skills", label="queen_ui", priority=2)
+            )
+
+        colony_overrides_path: Path | None = None
+        if colony_name:
+            colony_home = COLONIES_DIR / colony_name
+            colony_overrides_path = colony_home / "skills_overrides.json"
+            # Colony-scope SKILL.md dir is the project-scope from discovery's
+            # point of view (colony_dir is the project_root). Add it also as
+            # a tagged ``colony_ui`` scope so UI-created entries resolve with
+            # correct provenance.
+            extras.append(
+                ExtraScope(
+                    directory=colony_home / ".hive" / "skills",
+                    label="colony_ui",
+                    priority=3,
+                )
+            )
+
+        return SkillsManagerConfig(
+            queen_id=queen_id,
+            queen_overrides_path=queen_overrides_path,
+            colony_name=colony_name,
+            colony_overrides_path=colony_overrides_path,
+            extra_scope_dirs=extras,
+            interactive=False,  # HTTP-driven runtimes never prompt for consent
+        )
+
+    @property
+    def queen_id(self) -> str | None:
+        """The queen that owns this runtime, if known."""
+        return self._queen_id
+
+    @property
+    def colony_name(self) -> str | None:
+        """The on-disk colony name (distinct from event-bus scope ``colony_id``)."""
+        return self._colony_name
+
+    @property
+    def skills_manager(self):
+        """Access the live :class:`SkillsManager` (for HTTP handlers)."""
+        return self._skills_manager
+
+    async def reload_skills(self) -> dict[str, Any]:
+        """Rebuild the catalog after an override change; in-flight workers
+        pick up the new catalog on their next iteration via
+        ``dynamic_skills_catalog_provider``.
+
+        Returns a small stats dict that HTTP handlers can echo back to
+        the UI ("applied — N skills now in catalog").
+        """
+        async with self._skills_manager.mutation_lock:
+            self._skills_manager.reload()
+            self.skill_dirs = self._skills_manager.allowlisted_dirs
+            self.batch_init_nudge = self._skills_manager.batch_init_nudge
+            self.context_warn_ratio = self._skills_manager.context_warn_ratio
+            catalog_prompt = self._skills_manager.skills_catalog_prompt
+            return {
+                "catalog_chars": len(catalog_prompt),
+                "skill_dirs": list(self.skill_dirs),
+            }
 
     # ── Per-colony tool allowlist ───────────────────────────────
 
@@ -800,6 +901,23 @@ class ColonyRuntime:
                 conversation_store=worker_conv_store,
             )
 
+            # Workers pick up UI-driven override changes via this provider,
+            # which reads the live catalog on each iteration. The db_path
+            # pre-activated catalog stays static because its contents are
+            # built for *this* worker's task (a tombstone toggle from the
+            # UI should not yank it mid-run).
+            _db_path_pre_activated = bool(
+                isinstance(input_data, dict) and input_data.get("db_path")
+            )
+            # Default-bind the manager into the closure so each loop iteration
+            # captures the same manager instance — pyflakes B023 would flag a
+            # free-variable capture here.
+            _provider = (
+                None
+                if _db_path_pre_activated
+                else (lambda mgr=self._skills_manager: mgr.skills_catalog_prompt)
+            )
+
             agent_context = AgentContext(
                 runtime=self._make_runtime_adapter(worker_id),
                 agent_id=worker_id,
@@ -813,6 +931,7 @@ class ColonyRuntime:
                 skills_catalog_prompt=_spawn_catalog,
                 protocols_prompt=self.protocols_prompt,
                 skill_dirs=_spawn_skill_dirs,
+                dynamic_skills_catalog_provider=_provider,
                 execution_id=worker_id,
                 stream_id=explicit_stream_id or f"worker:{worker_id}",
             )
@@ -1057,6 +1176,7 @@ class ColonyRuntime:
             conversation_store=overseer_conv_store,
         )
 
+        _overseer_skills_mgr = self._skills_manager
         overseer_ctx = AgentContext(
             runtime=self._make_runtime_adapter(overseer_id),
             agent_id=overseer_id,
@@ -1070,6 +1190,7 @@ class ColonyRuntime:
             skills_catalog_prompt=self.skills_catalog_prompt,
             protocols_prompt=self.protocols_prompt,
             skill_dirs=self.skill_dirs,
+            dynamic_skills_catalog_provider=lambda: _overseer_skills_mgr.skills_catalog_prompt,
             execution_id=overseer_id,
             stream_id="overseer",
         )

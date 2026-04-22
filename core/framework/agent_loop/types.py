@@ -183,6 +183,13 @@ class AgentContext:
     dynamic_tools_provider: Any = None
     dynamic_prompt_provider: Any = None
     dynamic_memory_provider: Any = None
+    # Optional Callable[[], str]: when set, the current skills-catalog
+    # prompt is sourced from this provider each iteration. Lets workers
+    # pick up UI toggles without restarting the run. Queen agents already
+    # rebuild the whole prompt via dynamic_prompt_provider — this field
+    # is a surgical alternative used by colony workers where the rest of
+    # the prompt stays constant and we don't want to thrash the cache.
+    dynamic_skills_catalog_provider: Any = None
 
     skills_catalog_prompt: str = ""
     protocols_prompt: str = ""

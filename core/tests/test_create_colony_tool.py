@@ -204,6 +204,22 @@ async def test_happy_path_materializes_skill_under_colony_dir(patched_home: Path
     assert f"description: {description}" in text
     assert "HoneyComb API Operational Protocol" in text
 
+    # create_colony should also register the skill in the colony's
+    # override store with ``queen_created`` provenance so the UI can
+    # display it as queen-authored + editable.
+    from framework.skills.overrides import Provenance, SkillOverrideStore
+
+    overrides_path = (
+        patched_home / ".hive" / "colonies" / "honeycomb_research" / "skills_overrides.json"
+    )
+    assert overrides_path.exists(), "create_colony should write a skills_overrides.json ledger"
+    store = SkillOverrideStore.load(overrides_path)
+    entry = store.get("honeycomb-api-protocol")
+    assert entry is not None
+    assert entry.provenance == Provenance.QUEEN_CREATED
+    assert entry.enabled is True
+    assert (entry.created_by or "").startswith("queen:")
+
     # Critically: the skill must NOT land in the shared user-scope dir —
     # that was the leak we are fixing.
     assert not (patched_home / ".hive" / "skills" / "honeycomb-api-protocol").exists()

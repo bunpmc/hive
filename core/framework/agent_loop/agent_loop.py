@@ -793,10 +793,16 @@ class AgentLoop(AgentProtocol):
                 tools.extend(synthetic)
 
             # 6b3. Dynamic prompt refresh (phase switching / memory refresh)
-            if ctx.dynamic_prompt_provider is not None or ctx.dynamic_memory_provider is not None:
+            if (
+                ctx.dynamic_prompt_provider is not None
+                or ctx.dynamic_memory_provider is not None
+                or ctx.dynamic_skills_catalog_provider is not None
+            ):
                 if ctx.dynamic_prompt_provider is not None:
                     _new_prompt = stamp_prompt_datetime(ctx.dynamic_prompt_provider())
                 else:
+                    # build_system_prompt_for_context reads dynamic_skills_catalog_provider
+                    # directly; no separate branch needed.
                     _new_prompt = build_system_prompt_for_context(ctx)
                 if _new_prompt != conversation.system_prompt:
                     conversation.update_system_prompt(_new_prompt)

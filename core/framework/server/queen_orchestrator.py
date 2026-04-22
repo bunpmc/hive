@@ -653,12 +653,34 @@ async def create_queen(
     # ---- Default skill protocols -------------------------------------
     _queen_skill_dirs: list[str] = []
     try:
+        from framework.config import QUEENS_DIR
+        from framework.skills.discovery import ExtraScope
         from framework.skills.manager import SkillsManager, SkillsManagerConfig
 
-        # Pass project_root so user-scope skills (~/.hive/skills/, ~/.agents/skills/)
-        # are discovered. Queen has no agent-specific project root, so we use its
-        # own directory — the value just needs to be non-None to enable user-scope scanning.
-        _queen_skills_mgr = SkillsManager(SkillsManagerConfig(project_root=Path(__file__).parent))
+        # Queen home backs the queen-UI skill scope and the queen's
+        # override store. The directory already exists (or is created on
+        # demand by queen_profiles.py); treat a missing queen_name as the
+        # default queen to preserve backwards compatibility.
+        _queen_id = getattr(session, "queen_name", None) or "default"
+        _queen_home = QUEENS_DIR / _queen_id
+        _queen_skills_mgr = SkillsManager(
+            SkillsManagerConfig(
+                queen_id=_queen_id,
+                queen_overrides_path=_queen_home / "skills_overrides.json",
+                extra_scope_dirs=[
+                    ExtraScope(
+                        directory=_queen_home / "skills",
+                        label="queen_ui",
+                        priority=2,
+                    )
+                ],
+                # No project_root — queen's project is her own identity;
+                # user-scope discovery still runs without one.
+                project_root=None,
+                skip_community_discovery=True,
+                interactive=False,
+            )
+        )
         _queen_skills_mgr.load()
         phase_state.protocols_prompt = _queen_skills_mgr.protocols_prompt
         phase_state.skills_catalog_prompt = _queen_skills_mgr.skills_catalog_prompt

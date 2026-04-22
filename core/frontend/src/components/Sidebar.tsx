@@ -13,6 +13,7 @@ import {
   Crown,
   Loader2,
   Wrench,
+  Library,
 } from "lucide-react";
 import SidebarColonyItem from "./SidebarColonyItem";
 import SidebarQueenItem from "./SidebarQueenItem";
@@ -165,6 +166,13 @@ export default function Sidebar() {
         >
           <Network className="w-4 h-4" />
           <span>Org Chart</span>
+        </button>
+        <button
+          onClick={() => navigate("/skills-library")}
+          className="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
+        >
+          <Library className="w-4 h-4" />
+          <span>Skills Library</span>
         </button>
         <button
           onClick={() => navigate("/prompt-library")}

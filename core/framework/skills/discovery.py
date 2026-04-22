@@ -7,7 +7,7 @@ locations. Resolves name collisions deterministically.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from framework.skills.parser import ParsedSkill, parse_skill_md
@@ -33,11 +33,31 @@ _SKIP_DIRS = frozenset(
 _SCOPE_PRIORITY = {
     "framework": 0,
     "user": 1,
-    "project": 2,
+    "queen_ui": 2,
+    "colony_ui": 3,
+    "project": 4,
 }
 
 # Within the same scope, Hive-specific paths override cross-client paths.
 # We encode this by scanning cross-client first, then Hive-specific (later wins).
+
+
+@dataclass
+class ExtraScope:
+    """Additional scope dir to scan beyond the standard five.
+
+    Used by :class:`framework.skills.manager.SkillsManager` to surface
+    per-queen (``queen_ui``) and per-colony (``colony_ui``) skill
+    directories created through the UI. The ``label`` feeds
+    :attr:`ParsedSkill.source_scope` so downstream consumers (trust
+    gate, UI provenance resolver) can distinguish scope origins.
+    """
+
+    directory: Path
+    label: str
+    # Kept for forward-compat with the priority table; discovery itself
+    # relies on scan order for last-wins resolution.
+    priority: int = 0
 
 
 @dataclass
@@ -49,6 +69,10 @@ class DiscoveryConfig:
     skip_framework_scope: bool = False
     max_depth: int = 4
     max_dirs: int = 2000
+    # Additional scope dirs scanned between user and project scopes,
+    # in the order they are provided. Use ``ExtraScope`` to tag each
+    # with its logical label (``queen_ui`` / ``colony_ui``).
+    extra_scopes: list[ExtraScope] = field(default_factory=list)
 
 
 class SkillDiscovery:
@@ -104,6 +128,13 @@ class SkillDiscovery:
             if user_hive.is_dir():
                 self._scanned_dirs.append(user_hive)
                 all_skills.extend(self._scan_scope(user_hive, "user"))
+
+        # Extra scopes (queen_ui / colony_ui), scanned between user and project
+        # so colony overrides beat queen overrides, and both beat user-scope.
+        for extra in self._config.extra_scopes:
+            if extra.directory.is_dir():
+                self._scanned_dirs.append(extra.directory)
+                all_skills.extend(self._scan_scope(extra.directory, extra.label))
 
         # Project scope (highest precedence)
         if self._config.project_root:

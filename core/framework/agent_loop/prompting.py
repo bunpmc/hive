@@ -53,7 +53,14 @@ def build_prompt_spec(
     # trigger tools are present in this agent's tool list (e.g. browser_*
     # pulls in hive.browser-automation). Keeps non-browser agents lean.
     tool_names = [getattr(t, "name", "") for t in (getattr(ctx, "available_tools", None) or [])]
-    skills_catalog_prompt = augment_catalog_for_tools(ctx.skills_catalog_prompt or "", tool_names)
+    raw_catalog = ctx.skills_catalog_prompt or ""
+    dynamic_catalog = getattr(ctx, "dynamic_skills_catalog_provider", None)
+    if dynamic_catalog is not None:
+        try:
+            raw_catalog = dynamic_catalog() or ""
+        except Exception:
+            raw_catalog = ctx.skills_catalog_prompt or ""
+    skills_catalog_prompt = augment_catalog_for_tools(raw_catalog, tool_names)
 
     return PromptSpec(
         identity_prompt=ctx.identity_prompt or "",

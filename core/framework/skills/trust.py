@@ -318,13 +318,18 @@ class TrustGate:
     ) -> list[ParsedSkill]:
         """Return the subset of skills that are trusted for loading.
 
-        - Framework and user-scope skills: always included.
+        - Framework, user, queen_ui, and colony_ui scopes: always included.
+          (UI-created skills are authenticated by the user creating them
+          through the authenticated UI — they do not go through the
+          trusted_repos.json flow.)
         - Project-scope skills: classified; consent prompt shown if untrusted.
         """
         import os
 
-        # Separate project skills from always-trusted scopes
-        always_trusted = [s for s in skills if s.source_scope != "project"]
+        # UI-authored scopes bypass the trust gate — they're implicitly
+        # trusted because the user authored them through the UI.
+        _bypass_scopes = {"framework", "user", "queen_ui", "colony_ui"}
+        always_trusted = [s for s in skills if s.source_scope in _bypass_scopes]
         project_skills = [s for s in skills if s.source_scope == "project"]
 
         if not project_skills:

@@ -543,6 +543,10 @@ class NodeContext:
     # Dynamic memory provider — when set, EventLoopNode rebuilds the
     # system prompt with the latest memory block each iteration.
     dynamic_memory_provider: Any = None  # Callable[[], str] | None
+    # Surgical skills-catalog refresh, same contract as AgentContext's
+    # field of the same name. Lets workers pick up UI-driven skill
+    # toggles without rebuilding the full system prompt each turn.
+    dynamic_skills_catalog_provider: Any = None  # Callable[[], str] | None
 
     # Skill system prompts — injected by the skill discovery pipeline
     skills_catalog_prompt: str = ""  # Available skills XML catalog

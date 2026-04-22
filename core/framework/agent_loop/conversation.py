@@ -430,6 +430,16 @@ class NodeConversation:
         compaction_warning_buffer_tokens: int | None = None,
     ) -> None:
         self._system_prompt = system_prompt
+        # Optional split: when a caller updates the prompt with a
+        # ``dynamic_suffix`` argument, we remember the static prefix and
+        # suffix separately so the LLM wrapper can emit them as two
+        # Anthropic system content blocks with a cache breakpoint between
+        # them. ``_system_prompt`` stays as the concatenated form used for
+        # persistence and for the legacy single-block LLM path.
+        # On restore, these default to the concat/empty pair — the next
+        # AgentLoop iteration's dynamic-prompt refresh step repopulates.
+        self._system_prompt_static: str = system_prompt
+        self._system_prompt_dynamic_suffix: str = ""
         self._max_context_tokens = max_context_tokens
         self._compaction_threshold = compaction_threshold
         # Buffer-based compaction trigger (Gap 7). When set, takes
@@ -453,15 +463,58 @@ class NodeConversation:
 
     @property
     def system_prompt(self) -> str:
+        """Full concatenated system prompt (static + dynamic suffix, if any).
+
+        This is the canonical form used for persistence and for the legacy
+        single-block LLM path. Split-prompt callers should read
+        ``system_prompt_static`` and ``system_prompt_dynamic_suffix`` instead.
+        """
         return self._system_prompt
 
-    def update_system_prompt(self, new_prompt: str) -> None:
+    @property
+    def system_prompt_static(self) -> str:
+        """Static prefix of the system prompt (cache-stable).
+
+        Equals ``system_prompt`` when no split is in use. When the AgentLoop
+        calls ``update_system_prompt(static, dynamic_suffix=...)``, this is
+        the piece sent as the cache-controlled first block.
+        """
+        return self._system_prompt_static
+
+    @property
+    def system_prompt_dynamic_suffix(self) -> str:
+        """Dynamic tail of the system prompt (not cached).
+
+        Empty unless the consumer splits its prompt. The LLM wrapper uses a
+        non-empty suffix to emit a two-block system content list with a
+        cache breakpoint between the static prefix and this tail.
+        """
+        return self._system_prompt_dynamic_suffix
+
+    def update_system_prompt(self, new_prompt: str, dynamic_suffix: str | None = None) -> None:
         """Update the system prompt.
 
         Used in continuous conversation mode at phase transitions to swap
         Layer 3 (focus) while preserving the conversation history.
+
+        When ``dynamic_suffix`` is provided, ``new_prompt`` is interpreted as
+        the STATIC prefix and ``dynamic_suffix`` as the per-turn tail; they
+        travel to the LLM as two separate cache-controlled blocks but are
+        persisted as a single concatenated string for backward-compat
+        restore. ``new_prompt`` alone (suffix left None) keeps the legacy
+        single-string behavior.
         """
-        self._system_prompt = new_prompt
+        if dynamic_suffix is None:
+            # Legacy single-string path — static == full, no suffix split.
+            self._system_prompt = new_prompt
+            self._system_prompt_static = new_prompt
+            self._system_prompt_dynamic_suffix = ""
+        else:
+            self._system_prompt_static = new_prompt
+            self._system_prompt_dynamic_suffix = dynamic_suffix
+            self._system_prompt = (
+                f"{new_prompt}\n\n{dynamic_suffix}" if dynamic_suffix else new_prompt
+            )
         self._meta_persisted = False  # re-persist with new prompt
 
     def set_current_phase(self, phase_id: str) -> None:

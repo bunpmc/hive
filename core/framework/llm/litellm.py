@@ -218,6 +218,56 @@ def _model_supports_cache_control(model: str) -> bool:
     return any(model.startswith(p) for p in _CACHE_CONTROL_PREFIXES)
 
 
+def _build_system_message(
+    system: str,
+    system_dynamic_suffix: str | None,
+    model: str,
+) -> dict[str, Any] | None:
+    """Construct the system-role message for the chat completion.
+
+    Returns ``None`` when there is nothing to send.
+
+    Two-block split path — used when the caller supplied a non-empty
+    ``system_dynamic_suffix`` AND the provider honors ``cache_control``
+    (Anthropic, MiniMax, Z-AI/GLM). We emit ``content`` as a list of two
+    text blocks with an ephemeral ``cache_control`` marker on the first
+    block only. The prompt cache keeps the static prefix warm across
+    turns and across iterations within a turn; only the small dynamic
+    tail is recomputed on every request.
+
+    Single-string path — used for every other case (no suffix provided,
+    or provider doesn't honor ``cache_control``). We concatenate
+    ``system`` + ``\\n\\n`` + ``system_dynamic_suffix`` and attach
+    ``cache_control`` to the whole message when the provider supports
+    it. This is byte-identical to the pre-split behavior for all
+    non-cache-control providers (OpenAI, Gemini, Groq, Ollama, etc.).
+    """
+    if not system and not system_dynamic_suffix:
+        return None
+    if system_dynamic_suffix and _model_supports_cache_control(model):
+        content_blocks: list[dict[str, Any]] = []
+        if system:
+            content_blocks.append(
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+        content_blocks.append({"type": "text", "text": system_dynamic_suffix})
+        return {"role": "system", "content": content_blocks}
+    # Single-string path (legacy or no-cache-control provider).
+    combined = system
+    if system_dynamic_suffix:
+        combined = (
+            f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
+        )
+    sys_msg: dict[str, Any] = {"role": "system", "content": combined}
+    if _model_supports_cache_control(model):
+        sys_msg["cache_control"] = {"type": "ephemeral"}
+    return sys_msg
+
+
 # Kimi For Coding uses an Anthropic-compatible endpoint (no /v1 suffix).
 # Claude Code integration uses this format; the /v1 OpenAI-compatible endpoint
 # enforces a coding-agent whitelist that blocks unknown User-Agents.
@@ -1169,8 +1219,16 @@ class LiteLLMProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
         max_retries: int | None = None,
+        system_dynamic_suffix: str | None = None,
     ) -> LLMResponse:
-        """Async version of complete(). Uses litellm.acompletion — non-blocking."""
+        """Async version of complete(). Uses litellm.acompletion — non-blocking.
+
+        ``system_dynamic_suffix`` is an optional per-turn tail. When set and
+        the provider honors ``cache_control``, ``system`` is sent as the
+        cached prefix and the suffix trails as an uncached second content
+        block. Otherwise the two strings are concatenated into a single
+        system message (legacy behavior).
+        """
         # Codex ChatGPT backend requires streaming — route through stream() which
         # already handles Codex quirks and has proper tool call accumulation.
         if self._codex_backend:
@@ -1181,6 +1239,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
             return await self._collect_stream_to_response(stream_iter)
 
@@ -1188,10 +1247,8 @@ class LiteLLMProvider(LLMProvider):
         if self._claude_code_oauth:
             billing = _claude_code_billing_header(messages)
             full_messages.append({"role": "system", "content": billing})
-        if system:
-            sys_msg: dict[str, Any] = {"role": "system", "content": system}
-            if _model_supports_cache_control(self.model):
-                sys_msg["cache_control"] = {"type": "ephemeral"}
+        sys_msg = _build_system_message(system, system_dynamic_suffix, self.model)
+        if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
 
@@ -1660,8 +1717,19 @@ class LiteLLMProvider(LLMProvider):
         system: str,
         tools: list[Tool],
         max_tokens: int,
+        system_dynamic_suffix: str | None = None,
     ) -> LLMResponse:
-        """Emulate tool calling via JSON when OpenRouter rejects native tools."""
+        """Emulate tool calling via JSON when OpenRouter rejects native tools.
+
+        OpenRouter models don't honor ``cache_control`` on content blocks, so
+        when a ``system_dynamic_suffix`` is provided we simply concatenate it
+        onto ``system`` before building the compat messages — behaviorally
+        identical to today's single-string path.
+        """
+        if system_dynamic_suffix:
+            system = (
+                f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
+            )
         full_messages = self._build_openrouter_tool_compat_messages(messages, system, tools)
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1704,6 +1772,7 @@ class LiteLLMProvider(LLMProvider):
         system: str,
         tools: list[Tool],
         max_tokens: int,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Fallback stream for OpenRouter models without native tool support."""
         from framework.llm.stream_events import (
@@ -1724,6 +1793,7 @@ class LiteLLMProvider(LLMProvider):
                 system=system,
                 tools=tools,
                 max_tokens=max_tokens,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
             yield StreamErrorEvent(error=str(e), recoverable=False)
@@ -1758,6 +1828,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int,
         response_format: dict[str, Any] | None,
         json_mode: bool,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Fallback path: convert non-stream completion to stream events.
 
@@ -1781,6 +1852,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             )
         except Exception as e:
             yield StreamErrorEvent(error=str(e), recoverable=False)
@@ -1823,6 +1895,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream a completion via litellm.acompletion(stream=True).
 
@@ -1833,6 +1906,9 @@ class LiteLLMProvider(LLMProvider):
         Empty responses (e.g. Gemini stealth rate-limits that return 200
         with no content) are retried with exponential backoff, mirroring
         the retry behaviour of ``_completion_with_rate_limit_retry``.
+
+        ``system_dynamic_suffix`` is an optional per-turn tail. See
+        ``acomplete`` docstring for the two-block split semantics.
         """
         from framework.llm.stream_events import (
             FinishEvent,
@@ -1852,6 +1928,7 @@ class LiteLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 response_format=response_format,
                 json_mode=json_mode,
+                system_dynamic_suffix=system_dynamic_suffix,
             ):
                 yield event
             return
@@ -1862,6 +1939,7 @@ class LiteLLMProvider(LLMProvider):
                 system=system,
                 tools=tools,
                 max_tokens=max_tokens,
+                system_dynamic_suffix=system_dynamic_suffix,
             ):
                 yield event
             return
@@ -1870,10 +1948,8 @@ class LiteLLMProvider(LLMProvider):
         if self._claude_code_oauth:
             billing = _claude_code_billing_header(messages)
             full_messages.append({"role": "system", "content": billing})
-        if system:
-            sys_msg: dict[str, Any] = {"role": "system", "content": system}
-            if _model_supports_cache_control(self.model):
-                sys_msg["cache_control"] = {"type": "ephemeral"}
+        sys_msg = _build_system_message(system, system_dynamic_suffix, self.model)
+        if sys_msg is not None:
             full_messages.append(sys_msg)
         full_messages.extend(messages)
 

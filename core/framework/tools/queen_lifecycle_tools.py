@@ -185,6 +185,11 @@ class QueenPhaseState:
     # Cached recall blocks — populated async by recall_selector after each turn.
     _cached_global_recall_block: str = ""
     _cached_queen_recall_block: str = ""
+    # Cached dynamic system-prompt suffix — frozen at user-turn boundaries so
+    # AgentLoop iterations within a single turn send a byte-stable prompt and
+    # Anthropic's prompt cache keeps the static block warm. Rebuilt by
+    # refresh_dynamic_suffix() on CLIENT_INPUT_RECEIVED and on phase change.
+    _cached_dynamic_suffix: str = ""
     # Memory directories.
     global_memory_dir: Path | None = None
     queen_memory_dir: Path | None = None
@@ -280,8 +285,20 @@ class QueenPhaseState:
             self.rebuild_independent_filter()
         return self._filtered_independent_tools
 
-    def get_current_prompt(self) -> str:
-        """Return the system prompt for the current phase."""
+    def get_static_prompt(self) -> str:
+        """Return the stable portion of the system prompt for the current phase.
+
+        Includes identity, phase-role prompt, connected-integrations block,
+        skills catalog, and default skill protocols. These change only on
+        phase transition, queen identity selection, or when the user adds/
+        removes an integration — rare events. Designed to be byte-stable
+        across AgentLoop iterations within a single user turn so that
+        Anthropic's prompt cache keeps this block warm.
+
+        The dynamic tail (recall + timestamp) is returned separately by
+        ``get_dynamic_suffix()``; the LLM wrapper emits them as two system
+        content blocks with a cache breakpoint between them.
+        """
         if self.phase == "working":
             base = self.prompt_working
         elif self.phase == "reviewing":
@@ -315,11 +332,51 @@ class QueenPhaseState:
             parts.append(catalog_prompt)
         if self.protocols_prompt:
             parts.append(self.protocols_prompt)
+        return "\n\n".join(parts)
+
+    def refresh_dynamic_suffix(self) -> str:
+        """Rebuild and cache the dynamic system-prompt suffix.
+
+        The suffix contains recall blocks and the current date/time — the
+        pieces that genuinely change per user turn. Called from the
+        CLIENT_INPUT_RECEIVED subscriber so the suffix is byte-stable across
+        every AgentLoop iteration within a single user turn. Also called on
+        phase transition so the timestamp reflects the transition moment.
+        """
+        parts: list[str] = []
         if self._cached_global_recall_block:
             parts.append(self._cached_global_recall_block)
         if self._cached_queen_recall_block:
             parts.append(self._cached_queen_recall_block)
-        return "\n\n".join(parts)
+        local = datetime.now().astimezone()
+        parts.append(
+            f"Current date and time: {local.strftime('%Y-%m-%d %H:%M %Z (UTC%z)')}"
+        )
+        self._cached_dynamic_suffix = "\n\n".join(parts)
+        return self._cached_dynamic_suffix
+
+    def get_dynamic_suffix(self) -> str:
+        """Return the cached dynamic system-prompt suffix.
+
+        Lazily populates on first call so callers don't have to know about
+        the refresh lifecycle. Subsequent calls return the cached string
+        until ``refresh_dynamic_suffix()`` is invoked again.
+        """
+        if not self._cached_dynamic_suffix:
+            self.refresh_dynamic_suffix()
+        return self._cached_dynamic_suffix
+
+    def get_current_prompt(self) -> str:
+        """Return the concatenated system prompt (static + dynamic).
+
+        Retained for backward compatibility and for callers that want one
+        string (conversation persistence, debug dumps). The AgentLoop sends
+        the two pieces separately to the LLM so the cache can break between
+        them — see ``get_static_prompt()`` / ``get_dynamic_suffix()``.
+        """
+        static = self.get_static_prompt()
+        dynamic = self.get_dynamic_suffix()
+        return f"{static}\n\n{dynamic}" if dynamic else static
 
     async def _emit_phase_event(self) -> None:
         """Publish a QUEEN_PHASE_CHANGED event so the frontend updates the tag."""

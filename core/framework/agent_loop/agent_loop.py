@@ -799,14 +799,53 @@ class AgentLoop(AgentProtocol):
                 or ctx.dynamic_skills_catalog_provider is not None
             ):
                 if ctx.dynamic_prompt_provider is not None:
-                    _new_prompt = stamp_prompt_datetime(ctx.dynamic_prompt_provider())
+                    _new_prompt = ctx.dynamic_prompt_provider()
+                    # When a suffix provider is also wired (Queen's
+                    # static/dynamic split), keep the two pieces separate
+                    # so the LLM wrapper can emit them as two system
+                    # content blocks with a cache breakpoint between them.
+                    # The timestamp used to be stamped here via
+                    # stamp_prompt_datetime on every iteration — it now
+                    # lives inside the frozen dynamic suffix and is only
+                    # refreshed at user-turn boundaries, so per-iteration
+                    # stamping would both double-stamp and bust the cache.
+                    _new_suffix: str | None = None
+                    if ctx.dynamic_prompt_suffix_provider is not None:
+                        try:
+                            _new_suffix = ctx.dynamic_prompt_suffix_provider() or ""
+                        except Exception:
+                            logger.debug(
+                                "[%s] dynamic_prompt_suffix_provider raised — "
+                                "falling back to legacy stamp",
+                                node_id,
+                                exc_info=True,
+                            )
+                            _new_suffix = None
+                    if _new_suffix is None:
+                        # Legacy / fallback path: no split in use (or the
+                        # suffix provider raised). Stamp the timestamp at
+                        # the end of the single-string prompt so the model
+                        # still sees a current "now".
+                        _new_prompt = stamp_prompt_datetime(_new_prompt)
                 else:
                     # build_system_prompt_for_context reads dynamic_skills_catalog_provider
                     # directly; no separate branch needed.
                     _new_prompt = build_system_prompt_for_context(ctx)
-                if _new_prompt != conversation.system_prompt:
-                    conversation.update_system_prompt(_new_prompt)
-                    logger.info("[%s] Dynamic prompt updated", node_id)
+                    _new_suffix = None
+                if _new_suffix is not None:
+                    _combined_for_compare = (
+                        f"{_new_prompt}\n\n{_new_suffix}" if _new_suffix else _new_prompt
+                    )
+                    if (
+                        _combined_for_compare != conversation.system_prompt
+                        or _new_suffix != conversation.system_prompt_dynamic_suffix
+                    ):
+                        conversation.update_system_prompt(_new_prompt, dynamic_suffix=_new_suffix)
+                        logger.info("[%s] Dynamic prompt updated (split)", node_id)
+                else:
+                    if _new_prompt != conversation.system_prompt:
+                        conversation.update_system_prompt(_new_prompt)
+                        logger.info("[%s] Dynamic prompt updated", node_id)
 
             # 6c. Publish iteration event (with per-iteration metadata when available)
             _iter_meta = None
@@ -2437,9 +2476,18 @@ class AgentLoop(AgentProtocol):
                 nonlocal _first_event_at
                 _clean_snapshot = ""  # visible-only text for the frontend
 
+                # Split-prompt path: pass STATIC and DYNAMIC tail separately
+                # so the LLM wrapper can emit them as two Anthropic system
+                # content blocks with a cache breakpoint between them. When
+                # no split is in use, ``system_prompt_static`` equals the
+                # full prompt and the suffix is empty — identical to the
+                # legacy single-block request.
                 async for event in ctx.llm.stream(
                     messages=_msgs,
-                    system=conversation.system_prompt,
+                    system=conversation.system_prompt_static,
+                    system_dynamic_suffix=(
+                        conversation.system_prompt_dynamic_suffix or None
+                    ),
                     tools=tools if tools else None,
                     max_tokens=ctx.max_tokens,
                 ):

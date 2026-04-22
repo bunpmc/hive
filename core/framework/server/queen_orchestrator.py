@@ -736,8 +736,37 @@ async def create_queen(
 
     # ---- Recall on each real user turn --------------------------------
     async def _recall_on_user_input(event: AgentEvent) -> None:
-        """Re-select memories when real user input arrives."""
-        await _refresh_recall_cache((event.data or {}).get("content", ""))
+        """On real user input, freeze the dynamic system-prompt suffix and
+        refresh recall memories in the background.
+
+        The EventBus drops handlers that exceed 15s, so we MUST return fast.
+        Recall selection queries the LLM and can take >15s on slow backends;
+        we fire it off as a background task and re-stamp the suffix when it
+        completes. The immediate refresh_dynamic_suffix call stamps a fresh
+        timestamp using the last-known recall blocks so every iteration of
+        THIS user turn sees a byte-stable prompt (prompt cache hits on the
+        static block). Phase-change injections and worker-report injections
+        go through agent_loop.inject_event() and do NOT publish
+        CLIENT_INPUT_RECEIVED, so this runs exactly once per real user turn.
+        """
+        query = (event.data or {}).get("content", "")
+        # Immediate: stamp "now" into the frozen suffix, using whatever
+        # recall blocks we already cached (from the prior turn or seeding).
+        phase_state.refresh_dynamic_suffix()
+
+        async def _bg_refresh() -> None:
+            try:
+                await _refresh_recall_cache(query)
+                # Re-stamp with the fresh recall blocks. Any iteration that
+                # read the suffix before this point used the older recall
+                # — acceptable; recall was already eventual-consistency.
+                phase_state.refresh_dynamic_suffix()
+            except Exception:
+                logger.debug("background recall refresh failed", exc_info=True)
+
+        import asyncio as _asyncio
+
+        _asyncio.create_task(_bg_refresh())
 
     session.event_bus.subscribe(
         [EventType.CLIENT_INPUT_RECEIVED],
@@ -847,6 +876,9 @@ async def create_queen(
             except Exception:
                 logger.debug("recall: initial seeding failed", exc_info=True)
 
+        # Freeze the dynamic suffix once so the first real turn sends a
+        # byte-stable prompt even before CLIENT_INPUT_RECEIVED fires.
+        phase_state.refresh_dynamic_suffix()
         return HookResult(system_prompt=phase_state.get_current_prompt())
 
     # ---- Colony preparation -------------------------------------------
@@ -946,7 +978,8 @@ async def create_queen(
                 stream_id="queen",
                 execution_id=session.id,
                 dynamic_tools_provider=phase_state.get_current_tools,
-                dynamic_prompt_provider=phase_state.get_current_prompt,
+                dynamic_prompt_provider=phase_state.get_static_prompt,
+                dynamic_prompt_suffix_provider=phase_state.get_dynamic_suffix,
                 iteration_metadata_provider=lambda: {"phase": phase_state.phase},
                 skills_catalog_prompt=phase_state.skills_catalog_prompt,
                 protocols_prompt=phase_state.protocols_prompt,

@@ -71,7 +71,14 @@ export default function QueenDM() {
     { id: string; prompt: string; options?: string[] }[] | null
   >(null);
   const [awaitingInput, setAwaitingInput] = useState(false);
-  const [tokenUsage, setTokenUsage] = useState({ input: 0, output: 0 });
+  // `cached` and `cacheCreated` are subsets of `input` (providers count both
+  // inside prompt_tokens already) — display them, never add them to a total.
+  const [tokenUsage, setTokenUsage] = useState({
+    input: 0,
+    output: 0,
+    cached: 0,
+    cacheCreated: 0,
+  });
   const [historySessions, setHistorySessions] = useState<HistorySession[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [switchingSessionId, setSwitchingSessionId] = useState<string | null>(
@@ -118,7 +125,7 @@ export default function QueenDM() {
     setPendingQuestions(null);
     setAwaitingInput(false);
     setQueenPhase("independent");
-    setTokenUsage({ input: 0, output: 0 });
+    setTokenUsage({ input: 0, output: 0, cached: 0, cacheCreated: 0 });
     setInitialDraft(null);
     setColonySpawned(false);
     setSpawnedColonyName(null);
@@ -576,7 +583,16 @@ export default function QueenDM() {
           if (event.data) {
             const inp = (event.data.input_tokens as number) || 0;
             const out = (event.data.output_tokens as number) || 0;
-            setTokenUsage((prev) => ({ input: prev.input + inp, output: prev.output + out }));
+            // cached / cache_creation are subsets of input — accumulate
+            // separately for display, do NOT roll into input/total.
+            const cached = (event.data.cached_tokens as number) || 0;
+            const cacheCreated = (event.data.cache_creation_tokens as number) || 0;
+            setTokenUsage((prev) => ({
+              input: prev.input + inp,
+              output: prev.output + out,
+              cached: prev.cached + cached,
+              cacheCreated: prev.cacheCreated + cacheCreated,
+            }));
           }
           // Flush one queued message per LLM turn boundary. This is the
           // real "turn ended" signal in a queen DM — execution_completed

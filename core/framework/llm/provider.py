@@ -10,12 +10,19 @@ from typing import Any
 
 @dataclass
 class LLMResponse:
-    """Response from an LLM call."""
+    """Response from an LLM call.
+
+    ``cached_tokens`` and ``cache_creation_tokens`` are subsets of
+    ``input_tokens`` (providers report them inside ``prompt_tokens``).
+    Surface them for visibility; do not add to a total.
+    """
 
     content: str
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
     stop_reason: str = ""
     raw_response: Any = None
 
@@ -180,6 +187,8 @@ class LLMProvider(ABC):
             stop_reason=response.stop_reason,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
+            cached_tokens=response.cached_tokens,
+            cache_creation_tokens=response.cache_creation_tokens,
             model=response.model,
         )
 

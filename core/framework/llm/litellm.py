@@ -213,9 +213,24 @@ _CACHE_CONTROL_PREFIXES = (
     "glm-",
 )
 
+# OpenRouter sub-provider prefixes whose upstream API honors `cache_control`.
+# OpenRouter passes the marker through to the underlying provider for these.
+# (See https://openrouter.ai/docs/guides/best-practices/prompt-caching.)
+# OpenAI/DeepSeek/Groq/Grok/Moonshot route through OpenRouter but cache
+# automatically server-side — sending cache_control there is a no-op, not a
+# win, and they need a separate prefix-stability fix to actually get hits.
+_OPENROUTER_CACHE_CONTROL_PREFIXES = (
+    "openrouter/anthropic/",
+    "openrouter/google/gemini-",
+    "openrouter/z-ai/glm",
+    "openrouter/minimax/",
+)
+
 
 def _model_supports_cache_control(model: str) -> bool:
-    return any(model.startswith(p) for p in _CACHE_CONTROL_PREFIXES)
+    if any(model.startswith(p) for p in _CACHE_CONTROL_PREFIXES):
+        return True
+    return any(model.startswith(p) for p in _OPENROUTER_CACHE_CONTROL_PREFIXES)
 
 
 def _build_system_message(
@@ -343,6 +358,42 @@ FAILED_REQUESTS_DIR = Path.home() / ".hive" / "failed_requests"
 # Maximum number of dump files to retain in ~/.hive/failed_requests/.
 # Older files are pruned automatically to prevent unbounded disk growth.
 MAX_FAILED_REQUEST_DUMPS = 50
+
+
+def _extract_cache_tokens(usage: Any) -> tuple[int, int]:
+    """Pull (cache_read, cache_creation) from a LiteLLM usage object.
+
+    Both are subsets of ``prompt_tokens`` already — providers count them
+    inside the input total. Surface separately for visibility, never sum.
+
+    Field names vary by provider/proxy; check the known shapes in priority
+    order and fall back to 0:
+
+    cache_read:
+      - ``prompt_tokens_details.cached_tokens`` — OpenAI-shape; also what
+        LiteLLM normalizes Anthropic and OpenRouter into.
+      - ``cache_read_input_tokens`` — raw Anthropic field name.
+
+    cache_creation:
+      - ``prompt_tokens_details.cache_write_tokens`` — OpenRouter's
+        normalized field for cache writes (verified empirically against
+        ``openrouter/anthropic/*`` and ``openrouter/z-ai/*`` responses).
+      - ``cache_creation_input_tokens`` — raw Anthropic top-level field.
+    """
+    if not usage:
+        return 0, 0
+    _details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = (
+        getattr(_details, "cached_tokens", 0) or 0
+        if _details is not None
+        else getattr(usage, "cache_read_input_tokens", 0) or 0
+    )
+    cache_creation = (
+        getattr(_details, "cache_write_tokens", 0) or 0
+        if _details is not None
+        else 0
+    ) or (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    return cache_read, cache_creation
 
 
 def _estimate_tokens(model: str, messages: list[dict]) -> tuple[int, str]:
@@ -1063,12 +1114,15 @@ class LiteLLMProvider(LLMProvider):
         usage = response.usage
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0
+        cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
 
         return LLMResponse(
             content=content,
             model=response.model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             stop_reason=response.choices[0].finish_reason or "",
             raw_response=response,
         )
@@ -1283,12 +1337,15 @@ class LiteLLMProvider(LLMProvider):
         usage = response.usage
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0
+        cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
 
         return LLMResponse(
             content=content,
             model=response.model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             stop_reason=response.choices[0].finish_reason or "",
             raw_response=response,
         )
@@ -1674,6 +1731,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         system: str,
         tools: list[Tool],
+        system_dynamic_suffix: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build a JSON-only prompt for models without native tool support."""
         tool_specs = [
@@ -1701,7 +1759,19 @@ class LiteLLMProvider(LLMProvider):
         )
         compat_system = compat_instruction if not system else f"{system}\n\n{compat_instruction}"
 
-        full_messages: list[dict[str, Any]] = [{"role": "system", "content": compat_system}]
+        # If the routed sub-provider honors cache_control (e.g.
+        # openrouter/anthropic/*), split the static prefix from the dynamic
+        # suffix so the prefix stays cache-warm across turns. Otherwise fall
+        # back to a single concatenated string.
+        system_message = _build_system_message(
+            compat_system,
+            system_dynamic_suffix,
+            self.model,
+        )
+
+        full_messages: list[dict[str, Any]] = []
+        if system_message is not None:
+            full_messages.append(system_message)
         full_messages.extend(messages)
         return [
             message
@@ -1719,14 +1789,17 @@ class LiteLLMProvider(LLMProvider):
     ) -> LLMResponse:
         """Emulate tool calling via JSON when OpenRouter rejects native tools.
 
-        OpenRouter models don't honor ``cache_control`` on content blocks, so
-        when a ``system_dynamic_suffix`` is provided we simply concatenate it
-        onto ``system`` before building the compat messages — behaviorally
-        identical to today's single-string path.
+        When the routed sub-provider honors ``cache_control`` (e.g.
+        ``openrouter/anthropic/*``), the message builder splits the static
+        prefix from the dynamic suffix so the prefix stays cache-warm.
+        Otherwise the suffix is concatenated into a single system string.
         """
-        if system_dynamic_suffix:
-            system = f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
-        full_messages = self._build_openrouter_tool_compat_messages(messages, system, tools)
+        full_messages = self._build_openrouter_tool_compat_messages(
+            messages,
+            system,
+            tools,
+            system_dynamic_suffix=system_dynamic_suffix,
+        )
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": full_messages,
@@ -1747,6 +1820,7 @@ class LiteLLMProvider(LLMProvider):
         usage = response.usage
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0
+        cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
         stop_reason = "tool_calls" if tool_calls else (response.choices[0].finish_reason or "stop")
 
         return LLMResponse(
@@ -1754,6 +1828,8 @@ class LiteLLMProvider(LLMProvider):
             model=response.model or self.model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             stop_reason=stop_reason,
             raw_response={
                 "compat_mode": "openrouter_tool_emulation",
@@ -1813,6 +1889,8 @@ class LiteLLMProvider(LLMProvider):
             stop_reason=response.stop_reason,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
+            cached_tokens=response.cached_tokens,
+            cache_creation_tokens=response.cache_creation_tokens,
             model=response.model,
         )
 
@@ -1880,6 +1958,8 @@ class LiteLLMProvider(LLMProvider):
             stop_reason=response.stop_reason or "stop",
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
+            cached_tokens=response.cached_tokens,
+            cache_creation_tokens=response.cache_creation_tokens,
             model=response.model,
         )
 
@@ -2181,28 +2261,28 @@ class LiteLLMProvider(LLMProvider):
                             type(usage).__name__,
                         )
                         cached_tokens = 0
+                        cache_creation_tokens = 0
                         if usage:
                             input_tokens = getattr(usage, "prompt_tokens", 0) or 0
                             output_tokens = getattr(usage, "completion_tokens", 0) or 0
-                            _details = getattr(usage, "prompt_tokens_details", None)
-                            cached_tokens = (
-                                getattr(_details, "cached_tokens", 0) or 0
-                                if _details is not None
-                                else getattr(usage, "cache_read_input_tokens", 0) or 0
-                            )
+                            cached_tokens, cache_creation_tokens = _extract_cache_tokens(usage)
                             logger.debug(
-                                "[tokens] finish-chunk usage: input=%d output=%d cached=%d model=%s",
+                                "[tokens] finish-chunk usage: input=%d output=%d "
+                                "cached=%d cache_creation=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
+                                cache_creation_tokens,
                                 self.model,
                             )
 
                         logger.debug(
-                            "[tokens] finish event: input=%d output=%d cached=%d stop=%s model=%s",
+                            "[tokens] finish event: input=%d output=%d cached=%d "
+                            "cache_creation=%d stop=%s model=%s",
                             input_tokens,
                             output_tokens,
                             cached_tokens,
+                            cache_creation_tokens,
                             choice.finish_reason,
                             self.model,
                         )
@@ -2212,6 +2292,7 @@ class LiteLLMProvider(LLMProvider):
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 cached_tokens=cached_tokens,
+                                cache_creation_tokens=cache_creation_tokens,
                                 model=self.model,
                             )
                         )
@@ -2231,17 +2312,27 @@ class LiteLLMProvider(LLMProvider):
                             _usage = calculate_total_usage(chunks=_chunks)
                             input_tokens = _usage.prompt_tokens or 0
                             output_tokens = _usage.completion_tokens or 0
-                            _details = getattr(_usage, "prompt_tokens_details", None)
-                            cached_tokens = (
-                                getattr(_details, "cached_tokens", 0) or 0
-                                if _details is not None
-                                else getattr(_usage, "cache_read_input_tokens", 0) or 0
-                            )
+                            # `calculate_total_usage` aggregates token totals
+                            # but discards `prompt_tokens_details` — which is
+                            # where OpenRouter puts `cached_tokens` and
+                            # `cache_write_tokens`. Recover them directly
+                            # from the most recent chunk that carries usage.
+                            cached_tokens, cache_creation_tokens = 0, 0
+                            for _raw in reversed(_chunks):
+                                _raw_usage = getattr(_raw, "usage", None)
+                                if _raw_usage is None:
+                                    continue
+                                _cr, _cc = _extract_cache_tokens(_raw_usage)
+                                if _cr or _cc:
+                                    cached_tokens, cache_creation_tokens = _cr, _cc
+                                    break
                             logger.debug(
-                                "[tokens] post-loop chunks fallback: input=%d output=%d cached=%d model=%s",
+                                "[tokens] post-loop chunks fallback: input=%d output=%d "
+                                "cached=%d cache_creation=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
+                                cache_creation_tokens,
                                 self.model,
                             )
                             # Patch the FinishEvent already queued with 0 tokens
@@ -2252,6 +2343,7 @@ class LiteLLMProvider(LLMProvider):
                                         input_tokens=input_tokens,
                                         output_tokens=output_tokens,
                                         cached_tokens=cached_tokens,
+                                        cache_creation_tokens=cache_creation_tokens,
                                         model=_ev.model,
                                     )
                                     break
@@ -2462,6 +2554,8 @@ class LiteLLMProvider(LLMProvider):
         tool_calls: list[dict[str, Any]] = []
         input_tokens = 0
         output_tokens = 0
+        cached_tokens = 0
+        cache_creation_tokens = 0
         stop_reason = ""
         model = self.model
 
@@ -2479,6 +2573,8 @@ class LiteLLMProvider(LLMProvider):
             elif isinstance(event, FinishEvent):
                 input_tokens = event.input_tokens
                 output_tokens = event.output_tokens
+                cached_tokens = event.cached_tokens
+                cache_creation_tokens = event.cache_creation_tokens
                 stop_reason = event.stop_reason
                 if event.model:
                     model = event.model
@@ -2491,6 +2587,8 @@ class LiteLLMProvider(LLMProvider):
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             stop_reason=stop_reason,
             raw_response={"tool_calls": tool_calls} if tool_calls else None,
         )

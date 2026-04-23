@@ -151,8 +151,11 @@ interface ChatPanelProps {
   onStartNewSession?: () => void;
   /** When true, disable the start-new-session button (request in flight). */
   startingNewSession?: boolean;
-  /** Cumulative LLM token usage for this session */
-  tokenUsage?: { input: number; output: number };
+  /** Cumulative LLM token usage for this session.
+   *  `cached` (cache reads) and `cacheCreated` (cache writes) are subsets of
+   *  `input` — providers count both inside prompt_tokens. Display them
+   *  separately; do not add to a total. */
+  tokenUsage?: { input: number; output: number; cached?: number; cacheCreated?: number };
   /** Optional action element rendered on the right side of the "Conversation" header */
   headerAction?: React.ReactNode;
 }
@@ -1482,11 +1485,23 @@ export default function ChatPanel({
                 Context: {fmt(queenUsage.estimatedTokens)}/{fmt(queenUsage.maxTokens)}
               </span>
             )}
-            {hasTokens && (
-              <span title="LLM tokens used this session (input + output)">
-                Tokens: {fmt(tokenUsage!.input + tokenUsage!.output)}
-              </span>
-            )}
+            {hasTokens && (() => {
+              const cached = tokenUsage!.cached ?? 0;
+              const created = tokenUsage!.cacheCreated ?? 0;
+              // cached/created are subsets of input — never sum; surface separately.
+              const title = [
+                "LLM tokens used this session",
+                `input         ${fmt(tokenUsage!.input)}`,
+                `  cache read  ${fmt(cached)}`,
+                `  cache write ${fmt(created)}`,
+                `output        ${fmt(tokenUsage!.output)}`,
+              ].join("\n");
+              return (
+                <span title={title}>
+                  Tokens: {fmt(tokenUsage!.output)}
+                </span>
+              );
+            })()}
           </div>
         );
       })()}

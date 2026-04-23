@@ -812,6 +812,8 @@ class TestConveniencePublishers:
             model="claude-sonnet-4-20250514",
             input_tokens=100,
             output_tokens=50,
+            cached_tokens=30,
+            cache_creation_tokens=10,
             execution_id="exec_1",
             iteration=3,
         )
@@ -822,6 +824,10 @@ class TestConveniencePublishers:
         assert received[0].data["model"] == "claude-sonnet-4-20250514"
         assert received[0].data["input_tokens"] == 100
         assert received[0].data["output_tokens"] == 50
+        # cached / cache_creation are subsets of input — propagated for
+        # display, NOT additive to input_tokens.
+        assert received[0].data["cached_tokens"] == 30
+        assert received[0].data["cache_creation_tokens"] == 10
         assert received[0].data["iteration"] == 3
 
     @pytest.mark.asyncio

@@ -23,9 +23,12 @@ from framework.llm.anthropic import AnthropicProvider
 from framework.llm.litellm import (
     OPENROUTER_TOOL_COMPAT_MODEL_CACHE,
     LiteLLMProvider,
+    _build_system_message,
     _compute_retry_delay,
     _ensure_ollama_chat_prefix,
+    _extract_cache_tokens,
     _is_ollama_model,
+    _model_supports_cache_control,
     _summarize_request_for_log,
 )
 from framework.llm.provider import LLMProvider, LLMResponse, Tool
@@ -1192,3 +1195,320 @@ class TestGetLlmExtraKwargsOllama:
         with patch("framework.config.get_hive_config", return_value={}):
             result = get_llm_extra_kwargs()
         assert result == {}
+
+
+class TestModelSupportsCacheControl:
+    """`cache_control` allowlist covers native providers AND OpenRouter sub-providers
+    whose upstream API honors the marker (Anthropic, Gemini, GLM, MiniMax).
+    Auto-cache sub-providers (OpenAI, DeepSeek, Grok, Moonshot, Groq) are
+    intentionally excluded: sending cache_control is a no-op and a false win."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-opus-4-5",
+            "claude-3-5-sonnet-20241022",
+            "minimax/minimax-text-01",
+            "MiniMax-Text-01",
+            "zai-glm-4.6",
+            "glm-4.6",
+            "openrouter/anthropic/claude-opus-4.5",
+            "openrouter/anthropic/claude-sonnet-4.5",
+            "openrouter/google/gemini-2.5-pro",
+            "openrouter/google/gemini-2.5-flash",
+            "openrouter/z-ai/glm-5.1",
+            "openrouter/z-ai/glm-4.6",
+            "openrouter/minimax/minimax-text-01",
+        ],
+    )
+    def test_supported(self, model):
+        assert _model_supports_cache_control(model) is True
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-4o-mini",
+            "gemini/gemini-1.5-flash",
+            "ollama_chat/llama3",
+            "openrouter/openai/gpt-4o",
+            "openrouter/deepseek/deepseek-chat",
+            "openrouter/x-ai/grok-2",
+            "openrouter/moonshotai/kimi-k2",
+            "openrouter/liquid/lfm-2.5-1.2b-thinking:free",
+        ],
+    )
+    def test_unsupported(self, model):
+        assert _model_supports_cache_control(model) is False
+
+
+class TestBuildSystemMessageOpenRouter:
+    """`_build_system_message` should split static/dynamic blocks whenever
+    the model — native OR OpenRouter-routed — supports cache_control."""
+
+    def test_openrouter_anthropic_splits_into_two_blocks(self):
+        msg = _build_system_message(
+            system="static prefix",
+            system_dynamic_suffix="dynamic tail",
+            model="openrouter/anthropic/claude-opus-4.5",
+        )
+        assert msg == {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "static prefix",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "dynamic tail"},
+            ],
+        }
+
+    def test_openrouter_gemini_splits_into_two_blocks(self):
+        msg = _build_system_message(
+            system="static prefix",
+            system_dynamic_suffix="dynamic tail",
+            model="openrouter/google/gemini-2.5-pro",
+        )
+        assert isinstance(msg["content"], list)
+        assert msg["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert msg["content"][1] == {"type": "text", "text": "dynamic tail"}
+
+    def test_openrouter_glm_splits_into_two_blocks(self):
+        msg = _build_system_message(
+            system="static prefix",
+            system_dynamic_suffix="dynamic tail",
+            model="openrouter/z-ai/glm-5.1",
+        )
+        assert isinstance(msg["content"], list)
+        assert msg["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_openrouter_openai_stays_concatenated(self):
+        """OpenAI via OpenRouter auto-caches; sending cache_control is a no-op."""
+        msg = _build_system_message(
+            system="static prefix",
+            system_dynamic_suffix="dynamic tail",
+            model="openrouter/openai/gpt-4o",
+        )
+        assert msg == {
+            "role": "system",
+            "content": "static prefix\n\ndynamic tail",
+        }
+
+    def test_no_suffix_anthropic_gets_top_level_cache_control(self):
+        msg = _build_system_message(
+            system="static prefix",
+            system_dynamic_suffix=None,
+            model="openrouter/anthropic/claude-opus-4.5",
+        )
+        assert msg == {
+            "role": "system",
+            "content": "static prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+
+class TestOpenRouterToolCompatCacheControl:
+    """Tool-compat path must pass cache_control through when the routed
+    sub-provider honors it. Before this, the queen persona+tool-list prefix
+    was recomputed every turn on Anthropic/GLM via OpenRouter."""
+
+    def test_tool_compat_messages_split_for_cache_capable_model(self):
+        provider = LiteLLMProvider(
+            model="openrouter/anthropic/claude-opus-4.5",
+            api_key="test-key",
+        )
+        tools = [
+            Tool(
+                name="web_search",
+                description="Search the web",
+                parameters={"properties": {"query": {"type": "string"}}, "required": ["query"]},
+            )
+        ]
+
+        full_messages = provider._build_openrouter_tool_compat_messages(
+            messages=[{"role": "user", "content": "hi"}],
+            system="You are a queen.",
+            tools=tools,
+            system_dynamic_suffix="Current time: 2026-04-23T00:00:00Z",
+        )
+
+        system_msg = full_messages[0]
+        assert system_msg["role"] == "system"
+        assert isinstance(system_msg["content"], list)
+        assert len(system_msg["content"]) == 2
+
+        static_block = system_msg["content"][0]
+        assert static_block["cache_control"] == {"type": "ephemeral"}
+        assert "You are a queen." in static_block["text"]
+        assert "Tool compatibility mode is active" in static_block["text"]
+        assert "web_search" in static_block["text"]
+        assert "2026-04-23" not in static_block["text"]
+
+        dynamic_block = system_msg["content"][1]
+        assert "cache_control" not in dynamic_block
+        assert dynamic_block["text"] == "Current time: 2026-04-23T00:00:00Z"
+
+    def test_tool_compat_messages_stay_concatenated_for_liquid(self):
+        """Liquid (and other non-cache-control OR sub-providers) keep legacy behavior."""
+        provider = LiteLLMProvider(
+            model="openrouter/liquid/lfm-2.5-1.2b-thinking:free",
+            api_key="test-key",
+        )
+        tools = [
+            Tool(
+                name="web_search",
+                description="Search the web",
+                parameters={"properties": {"query": {"type": "string"}}, "required": ["query"]},
+            )
+        ]
+
+        full_messages = provider._build_openrouter_tool_compat_messages(
+            messages=[{"role": "user", "content": "hi"}],
+            system="You are a queen.",
+            tools=tools,
+            system_dynamic_suffix="Current time: 2026-04-23T00:00:00Z",
+        )
+
+        system_msg = full_messages[0]
+        assert isinstance(system_msg["content"], str)
+        assert "2026-04-23" in system_msg["content"]
+        assert "cache_control" not in system_msg
+
+
+class TestExtractCacheTokens:
+    """`_extract_cache_tokens` reads cache_read + cache_creation from the
+    LiteLLM-normalized usage object. Both fields are subsets of
+    ``prompt_tokens`` — the helper surfaces them for display, the call sites
+    are responsible for never adding them to a total."""
+
+    def test_none_usage_returns_zero(self):
+        assert _extract_cache_tokens(None) == (0, 0)
+
+    def test_openai_shape(self):
+        """Pure OpenAI responses expose cached reads via
+        ``prompt_tokens_details.cached_tokens`` and have no cache write
+        field at all (OpenAI's automatic caching is read-only from the
+        client's perspective)."""
+        usage = MagicMock(spec=["prompt_tokens_details", "cache_creation_input_tokens"])
+        usage.prompt_tokens_details = MagicMock(
+            spec=["cached_tokens"], cached_tokens=120,
+        )
+        usage.cache_creation_input_tokens = 0
+        cache_read, cache_creation = _extract_cache_tokens(usage)
+        assert cache_read == 120
+        assert cache_creation == 0
+
+    def test_openrouter_cache_write_tokens_shape(self):
+        """OpenRouter normalizes cache writes into
+        ``prompt_tokens_details.cache_write_tokens`` (verified empirically
+        against openrouter/anthropic and openrouter/z-ai responses). The
+        legacy ``usage.cache_creation_input_tokens`` field is NOT set on
+        OpenRouter responses, so this is the path that matters in practice."""
+        usage = MagicMock()
+        usage.prompt_tokens_details = MagicMock(
+            cached_tokens=80, cache_write_tokens=50,
+        )
+        # Explicitly set the Anthropic-native field to 0 to prove we don't
+        # depend on it for OpenRouter responses.
+        usage.cache_creation_input_tokens = 0
+        cache_read, cache_creation = _extract_cache_tokens(usage)
+        assert cache_read == 80
+        assert cache_creation == 50
+
+    def test_anthropic_native_cache_creation_field_still_works(self):
+        """Direct Anthropic API responses (not via OpenRouter) put cache
+        writes on the top-level ``cache_creation_input_tokens`` field. Keep
+        the fallback so non-OpenRouter Anthropic continues to work."""
+        usage = MagicMock(spec=["prompt_tokens_details", "cache_creation_input_tokens"])
+        usage.prompt_tokens_details = MagicMock(
+            spec=["cached_tokens"], cached_tokens=80,
+        )
+        usage.cache_creation_input_tokens = 50
+        cache_read, cache_creation = _extract_cache_tokens(usage)
+        assert cache_read == 80
+        assert cache_creation == 50
+
+    def test_raw_anthropic_shape_falls_back(self):
+        """Raw Anthropic usage (no prompt_tokens_details) — fall back to
+        cache_read_input_tokens."""
+        usage = MagicMock(spec=["cache_read_input_tokens", "cache_creation_input_tokens"])
+        usage.cache_read_input_tokens = 200
+        usage.cache_creation_input_tokens = 75
+        # Force prompt_tokens_details to be missing on the spec'd mock.
+        cache_read, cache_creation = _extract_cache_tokens(usage)
+        assert cache_read == 200
+        assert cache_creation == 75
+
+    def test_no_cache_fields_returns_zero(self):
+        """A provider that doesn't report cache tokens at all (e.g. Gemini)
+        returns (0, 0) — never raises."""
+        usage = MagicMock(spec=["prompt_tokens", "completion_tokens"])
+        cache_read, cache_creation = _extract_cache_tokens(usage)
+        assert cache_read == 0
+        assert cache_creation == 0
+
+
+class TestStreamingChunksFallbackPreservesCacheFields:
+    """Regression: when LiteLLM strips usage from yielded streaming chunks,
+    we fall back to ``response.chunks`` to recover token totals. LiteLLM's
+    own ``calculate_total_usage()`` aggregates ``prompt_tokens`` /
+    ``completion_tokens`` correctly but DROPS ``prompt_tokens_details`` —
+    which is where OpenRouter places ``cached_tokens`` and
+    ``cache_write_tokens``. The fallback path must walk the raw chunks to
+    recover those fields, otherwise streaming OpenRouter calls always
+    report zero cache tokens. (Verified empirically against
+    openrouter/anthropic/* and openrouter/z-ai/*.)"""
+
+    def test_chunks_with_cache_fields_recovered(self):
+        """Simulate the chunks-fallback hot path: build raw chunks where the
+        last one carries cache_write_tokens, run the same recovery loop the
+        streaming code uses, and assert we surface the cache fields."""
+        # Three chunks: text deltas, then a final chunk with usage.
+        empty_usage_chunk = MagicMock()
+        empty_usage_chunk.usage = None
+        last_chunk = MagicMock()
+        last_chunk.usage = MagicMock()
+        last_chunk.usage.prompt_tokens_details = MagicMock(
+            cached_tokens=0, cache_write_tokens=5601,
+        )
+        last_chunk.usage.cache_creation_input_tokens = 0
+        chunks = [empty_usage_chunk, empty_usage_chunk, last_chunk]
+
+        # Mirror the production loop in litellm.py's chunks-fallback.
+        cached, creation = 0, 0
+        for raw in reversed(chunks):
+            usage = getattr(raw, "usage", None)
+            if usage is None:
+                continue
+            cr, cc = _extract_cache_tokens(usage)
+            if cr or cc:
+                cached, creation = cr, cc
+                break
+
+        assert cached == 0
+        assert creation == 5601, (
+            "chunks-fallback must recover cache_write_tokens from the raw "
+            "chunk, not from calculate_total_usage which strips details"
+        )
+
+    def test_chunks_with_cache_read_recovered(self):
+        """Same path, but for a cache HIT (cached_tokens populated)."""
+        last_chunk = MagicMock()
+        last_chunk.usage = MagicMock()
+        last_chunk.usage.prompt_tokens_details = MagicMock(
+            cached_tokens=5601, cache_write_tokens=0,
+        )
+        last_chunk.usage.cache_creation_input_tokens = 0
+
+        cached, creation = 0, 0
+        for raw in reversed([last_chunk]):
+            usage = getattr(raw, "usage", None)
+            if usage is None:
+                continue
+            cr, cc = _extract_cache_tokens(usage)
+            if cr or cc:
+                cached, creation = cr, cc
+                break
+
+        assert cached == 5601
+        assert creation == 0
